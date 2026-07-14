@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build output (produced fresh by CI every build)
+/build/
+/dist/
+/dist_installer/
+*.spec.bak
+ffmpeg.zip
+ffmpeg_extracted/
+ffmpeg.exe
+
+# local render output / scratch
+*.mp4
+*.wav
+
+# packaged zip produced for manual distribution (rebuild instead of committing)
+kami_visualizer.zip

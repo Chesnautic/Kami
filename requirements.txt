@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+Pillow>=10.0
+
+# Also requires the ffmpeg command-line tool to be installed and on PATH.
+# (No librosa/audio-decoding libraries needed — analysis is done directly
+# from the WAV PCM data with numpy/scipy.)
