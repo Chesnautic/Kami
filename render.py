@@ -140,6 +140,27 @@ def make_ffmpeg_process(out_path: str, wav_path: str, w: int, h: int, fps: float
 
 
 def main(argv=None):
+    # Force unbuffered/line-buffered stdout+stderr. In dev mode gui.py launches
+    # this with `python -u`, which guarantees prompt flushing; a packaged/
+    # frozen exe has no such flag to pass (PyInstaller bootloaders don't
+    # accept Python's own CLI switches), so without this fix the C stdio
+    # layer can sit on every print() in a block buffer for minutes at a
+    # time -- the render is genuinely progressing, but the GUI watching
+    # this process's stdout sees nothing arrive and looks completely
+    # frozen. Also guard against sys.stdout/stderr being None, which
+    # PyInstaller's windowed (console=False) builds can produce when no
+    # handle was inherited -- printing to None would crash the worker
+    # silently from the GUI's point of view.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     args = build_arg_parser().parse_args(argv)
     args = merge_config(args)
 

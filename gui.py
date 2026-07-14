@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, colorchooser, messagebox
 
@@ -113,6 +114,9 @@ class VisualizerGUI:
         self._snippet_drag = None  # "start" | "end" | None, which handle is being dragged
         self._snippet_temp_wav: str | None = None  # scratch file for scrub-preview playback
         self._is_playing = False
+        self._playback_range = (0.0, 0.0)  # (start, end) seconds in the source track currently playing
+        self._playback_started_at = 0.0  # time.monotonic() when the current playback began
+        self._playhead_after_id = None
 
         self.palette_preset = tk.StringVar(value=DEFAULT_PALETTE)
         preset_hex = palette_to_hex_fields(PALETTES[DEFAULT_PALETTE])
@@ -133,7 +137,13 @@ class VisualizerGUI:
         self.particle_density = tk.DoubleVar(value=1.0)
         self.switch_speed = tk.DoubleVar(value=1.0)
 
-        self.pattern_enabled = {name: tk.BooleanVar(value=True) for name in PATTERN_NAMES}
+        # Default to only the original Pack 1 (Waveforms) patterns enabled --
+        # the other packs (cars, space/sunsets, retro y2k) are opt-in extra
+        # variation rather than being on by default.
+        _default_on = set(SCENE_PACKS.get("waveforms", []))
+        self.pattern_enabled = {
+            name: tk.BooleanVar(value=(name in _default_on)) for name in PATTERN_NAMES
+        }
         self.preview_pattern = tk.StringVar(value=PATTERN_NAMES[0])
 
         self.resolution = tk.StringVar(value="1280x720")
@@ -162,6 +172,11 @@ class VisualizerGUI:
         if self._preview_after_id is not None:
             try:
                 self.root.after_cancel(self._preview_after_id)
+            except Exception:
+                pass
+        if self._playhead_after_id is not None:
+            try:
+                self.root.after_cancel(self._playhead_after_id)
             except Exception:
                 pass
         if self._render_proc and self._render_proc.poll() is None:
@@ -263,7 +278,7 @@ class VisualizerGUI:
         bottom = tk.Frame(self.root, bg=BG)
         bottom.pack(fill="x", padx=14, pady=(6, 12))
 
-        self.render_button = tk.Button(bottom, text="Render Full Video", command=self._start_render,
+        self.render_button = tk.Button(bottom, text="Export Video", command=self._start_render,
                                         bg=ACCENT, fg="#150015", relief="flat", padx=14, pady=8,
                                         font=("TkDefaultFont", 11, "bold"))
         self.render_button.pack(side="left")
@@ -611,6 +626,11 @@ class VisualizerGUI:
                 c.create_rectangle(ex, 0, cw, ch, fill="#000000", stipple="gray50", outline="")
             c.create_line(sx, 0, sx, ch, fill="#39ff88", width=2)
             c.create_line(ex, 0, ex, ch, fill="#ff4466", width=2)
+            if self._is_playing:
+                play_start, _play_end = self._playback_range
+                elapsed = time.monotonic() - self._playback_started_at
+                px = self._snippet_time_to_x(play_start + max(0.0, elapsed))
+                c.create_line(px, 0, px, ch, fill="#ffe066", width=2)
         else:
             c.create_line(0, mid, cw, mid, fill="#3a2440")
             c.create_text(cw / 2, ch / 2, text="(load a WAV to see its waveform)", fill="#5a4a6a")
@@ -684,7 +704,7 @@ class VisualizerGUI:
             except Exception as e:
                 self.root.after(0, lambda: self.status_var.set(f"Playback error: {e}"))
                 return
-            self.root.after(0, lambda: self._set_playing_state(True))
+            self.root.after(0, lambda: self._set_playing_state(True, start, end))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -696,10 +716,39 @@ class VisualizerGUI:
                 pass
         self._set_playing_state(False)
 
-    def _set_playing_state(self, playing: bool):
+    def _set_playing_state(self, playing: bool, start: float = 0.0, end: float = 0.0):
         self._is_playing = playing
         if hasattr(self, "stop_playback_btn"):
             self.stop_playback_btn.configure(state="normal" if playing else "disabled")
+        if self._playhead_after_id is not None:
+            try:
+                self.root.after_cancel(self._playhead_after_id)
+            except Exception:
+                pass
+            self._playhead_after_id = None
+        if playing:
+            self._playback_range = (start, end)
+            self._playback_started_at = time.monotonic()
+            self._tick_playhead()
+        else:
+            self._playback_range = (0.0, 0.0)
+            self._draw_waveform()  # clear the playhead marker
+
+    def _tick_playhead(self):
+        # Wall-clock-driven moving position marker over the waveform during
+        # preview playback, and the mechanism that notices a clip has
+        # finished playing on its own (winsound gives no completion
+        # callback) so the Stop button/marker don't just stay stuck on.
+        if not self._is_playing:
+            return
+        start, end = self._playback_range
+        elapsed = time.monotonic() - self._playback_started_at
+        if elapsed >= max(0.05, end - start):
+            self._playhead_after_id = None
+            self._set_playing_state(False)
+            return
+        self._draw_waveform()
+        self._playhead_after_id = self.root.after(40, self._tick_playhead)
 
     def _analyze_wav_async(self):
         self._analysis_token += 1
@@ -834,6 +883,7 @@ class VisualizerGUI:
         )
         # only pass a trim range if the user actually narrowed it from the
         # full track -- avoids an unnecessary re-copy of the whole WAV
+        trimmed = False
         if self.wav_duration > 0:
             trimmed = self.snippet_start > 0.05 or self.snippet_end < self.wav_duration - 0.05
             if trimmed:
@@ -848,7 +898,14 @@ class VisualizerGUI:
         self.render_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.progress.configure(value=0)
-        self.status_var.set(f"Rendering -> {out_path} ...")
+        # make it unambiguous whether the trim selection is actually being
+        # used, since that was previously invisible at export time
+        if trimmed:
+            range_note = (f" (using {_format_time(self.snippet_start)}-{_format_time(self.snippet_end)} "
+                          f"of {_format_time(self.wav_duration)})")
+        else:
+            range_note = " (using the full track)"
+        self.status_var.set(f"Exporting -> {out_path}{range_note} -- starting...")
 
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         proc = subprocess.Popen(
@@ -859,16 +916,31 @@ class VisualizerGUI:
         self._render_proc = proc
         threading.Thread(target=self._watch_render, args=(proc, cfg_path, out_path), daemon=True).start()
 
+    def _update_render_progress(self, pct: float, line: str):
+        self.progress.configure(value=pct)
+        self.status_var.set(line)
+
     def _watch_render(self, proc: subprocess.Popen, cfg_path: str, out_path: str):
+        # Stream EVERY meaningful line from the worker's stdout into the
+        # status bar, not just the ones with a "%" in them -- previously
+        # the GUI only ever reacted to percent-progress lines, so long
+        # stretches with no percent output (audio analysis, schedule
+        # building) made the whole export look stalled even while it was
+        # genuinely working.
         pct_re = re.compile(r"(\d+(?:\.\d+)?)%")
         last_line = ""
         try:
-            for line in proc.stdout:
-                last_line = line.strip()
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                last_line = line
                 m = pct_re.search(line)
                 if m:
                     pct = float(m.group(1))
-                    self.root.after(0, lambda p=pct: self.progress.configure(value=p))
+                    self.root.after(0, lambda p=pct, l=line: self._update_render_progress(p, l))
+                else:
+                    self.root.after(0, lambda l=line: self.status_var.set(l))
         except Exception:
             pass
         proc.wait()
