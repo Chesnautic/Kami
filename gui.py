@@ -76,20 +76,54 @@ def _install_dir() -> str:
     return SCRIPT_DIR
 
 
-DEBUG_LOG_PATH = os.path.join(_install_dir(), "kami_debug.log")
+def _debug_log_paths() -> list[str]:
+    # Write to several locations, independently, and don't let one failing
+    # stop the others. The install folder isn't guaranteed to be writable
+    # by a non-admin process (depending on exactly where Inno Setup put
+    # it), and that failure was previously silent -- so a log file that
+    # never appeared could just as easily mean "couldn't write here" as
+    # "never got called". The Desktop copy is the important one: every
+    # normal Windows user account can write there and it's impossible to
+    # lose track of.
+    paths = []
+    try:
+        paths.append(os.path.join(_install_dir(), "kami_debug.log"))
+    except Exception:
+        pass
+    try:
+        paths.append(os.path.join(os.path.expanduser("~"), "Desktop", "kami_debug.log"))
+    except Exception:
+        pass
+    try:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            paths.append(os.path.join(local_appdata, "Kami", "kami_debug.log"))
+    except Exception:
+        pass
+    try:
+        import tempfile as _tf
+        paths.append(os.path.join(_tf.gettempdir(), "kami_debug.log"))
+    except Exception:
+        pass
+    return paths
+
+
+DEBUG_LOG_PATHS = _debug_log_paths()
 
 
 def _log_debug(msg: str):
     # Plain-file logging, deliberately independent of any Tk/Tcl machinery
     # (no messagebox, no Toplevel, nothing that could itself be broken).
     # If popups/dialogs are ever the thing silently failing in a packaged
-    # build, this is the one diagnostic channel that still works -- it's
-    # just a text file next to Kami.exe.
-    try:
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
-    except Exception:
-        pass
+    # build, this is the one diagnostic channel that still works.
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+    for path in DEBUG_LOG_PATHS:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
 
 
 def _render_subprocess_cmd(cfg_path: str) -> list[str]:
