@@ -67,6 +67,31 @@ RENDER_SCRIPT = os.path.join(SCRIPT_DIR, "render.py")
 RENDER_WORKER_FLAG = "--render-worker"  # keep in sync with Kami.pyw
 
 
+def _install_dir() -> str:
+    # Next to the actual running exe when frozen, so this lands somewhere
+    # the user can actually find it (right next to Kami.exe), not buried
+    # in a PyInstaller onedir's internal bundle folder.
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return SCRIPT_DIR
+
+
+DEBUG_LOG_PATH = os.path.join(_install_dir(), "kami_debug.log")
+
+
+def _log_debug(msg: str):
+    # Plain-file logging, deliberately independent of any Tk/Tcl machinery
+    # (no messagebox, no Toplevel, nothing that could itself be broken).
+    # If popups/dialogs are ever the thing silently failing in a packaged
+    # build, this is the one diagnostic channel that still works -- it's
+    # just a text file next to Kami.exe.
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
 def _render_subprocess_cmd(cfg_path: str) -> list[str]:
     """Build the command that runs a render as a separate process.
 
@@ -166,11 +191,14 @@ class VisualizerGUI:
         self.preview_photo = None
 
         self._preview_after_id = None
+        _log_debug(f"App starting. frozen={getattr(sys, 'frozen', False)} "
+                   f"executable={sys.executable} argv={sys.argv}")
         self._install_global_exception_guard()
         self._build_layout()
         self._wire_color_reset_traces()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick_preview()
+        _log_debug("App window built and preview loop started.")
 
     def _install_global_exception_guard(self):
         # A packaged, windowed (console=False) build has nowhere for an
@@ -180,11 +208,14 @@ class VisualizerGUI:
         # here (e.g. the export subprocess failing to even launch) look
         # exactly like "nothing happens": the button greys out, and then
         # silently nothing ever follows up. This guard makes sure any such
-        # failure always surfaces as a visible error dialog instead.
+        # failure always gets logged, and best-effort surfaced as a visible
+        # error dialog too (the log write happens first and does not depend
+        # on any Tk/Tcl dialog machinery working at all).
         import traceback as _tb
 
         def handler(exc_type, exc_value, exc_tb):
             details = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+            _log_debug(f"UNCAUGHT EXCEPTION in a callback:\n{details}")
             try:
                 self.status_var.set(f"Unexpected error: {exc_value}")
             except Exception:
@@ -197,7 +228,8 @@ class VisualizerGUI:
                 pass
             try:
                 messagebox.showerror("Unexpected error",
-                                      f"Something went wrong:\n\n{exc_value}\n\n{details[-1500:]}")
+                                      f"Something went wrong:\n\n{exc_value}\n\n{details[-1500:]}\n\n"
+                                      f"(full details also saved to kami_debug.log next to Kami.exe)")
             except Exception:
                 pass
 
@@ -890,11 +922,20 @@ class VisualizerGUI:
     # rendering
     # ------------------------------------------------------------------
     def _start_render(self):
+        # First line, no exceptions, nothing that could fail -- this alone
+        # proves whether the Export button's click is even reaching this
+        # function at all. Check kami_debug.log next to Kami.exe if export
+        # still seems to do nothing -- if this line isn't in there, the
+        # click itself isn't the problem, something upstream of it is.
+        _log_debug("Export button clicked.")
+
         if not self.wav_path:
+            _log_debug("Export aborted: no WAV file selected.")
             messagebox.showwarning("No file", "Pick a WAV file first.")
             return
         pool = [name for name, var in self.pattern_enabled.items() if var.get()]
         if not pool:
+            _log_debug("Export aborted: no patterns enabled.")
             messagebox.showwarning("No patterns", "Enable at least one pattern.")
             return
 
@@ -904,6 +945,7 @@ class VisualizerGUI:
             try:
                 seed = int(self.seed_var.get().strip())
             except ValueError:
+                _log_debug("Export aborted: seed field isn't a valid integer.")
                 messagebox.showwarning("Bad seed", "Seed must be an integer, or leave it blank.")
                 return
 
@@ -939,12 +981,14 @@ class VisualizerGUI:
         # completely (a packaged, windowed exe has no console for an
         # unhandled exception to print to) -- wrap it all so any failure,
         # even one before the worker process exists, always surfaces as a
-        # visible error instead of the button just quietly re-enabling
-        # itself (or not) with no explanation.
+        # visible error (and always gets logged) instead of the button
+        # just quietly re-enabling itself (or not) with no explanation.
         try:
+            _log_debug(f"Export config: out={out_path} trimmed={trimmed} patterns={len(pool)} seed={seed}")
             fd, cfg_path = tempfile.mkstemp(suffix=".json", prefix="y2k_gui_config_")
             with os.fdopen(fd, "w") as fh:
                 json.dump(cfg, fh, indent=2)
+            _log_debug(f"Wrote config to {cfg_path}")
 
             self._render_canceled = False
             self._stop_playback()
@@ -952,20 +996,43 @@ class VisualizerGUI:
             self.cancel_button.configure(state="normal")
             self.progress_var.set(0)
             self.status_var.set(start_msg)
-            self._open_export_dialog()
 
+            # The export dialog is a nice-to-have, not a requirement -- if
+            # showing it fails for any reason (a broken Tk/Tcl dialog
+            # subsystem in this particular packaged build would be exactly
+            # the kind of thing that could make every popup silently do
+            # nothing), that must NOT prevent the actual export from
+            # running. Isolate it in its own try so a dialog failure can
+            # never block the subprocess launch below.
+            try:
+                self._open_export_dialog()
+            except Exception as dlg_e:
+                _log_debug(f"Export dialog failed to open (non-fatal, continuing): {dlg_e!r}")
+
+            _log_debug(f"Launching worker: {_render_subprocess_cmd(cfg_path)}")
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             proc = subprocess.Popen(
                 _render_subprocess_cmd(cfg_path),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                 creationflags=creationflags,
             )
+            _log_debug(f"Worker process launched, pid={proc.pid}")
         except Exception as e:
-            self._close_export_dialog()
+            import traceback as _tb
+            _log_debug(f"EXPORT FAILED TO START: {e!r}\n{_tb.format_exc()}")
+            try:
+                self._close_export_dialog()
+            except Exception:
+                pass
             self.render_button.configure(state="normal")
             self.cancel_button.configure(state="disabled")
             self.status_var.set(f"Export failed to start: {e}")
-            messagebox.showerror("Export failed to start", f"Couldn't start the export process:\n\n{e}")
+            try:
+                messagebox.showerror("Export failed to start",
+                                      f"Couldn't start the export process:\n\n{e}\n\n"
+                                      f"(full details also saved to kami_debug.log next to Kami.exe)")
+            except Exception:
+                pass
             return
 
         self._render_proc = proc
@@ -1036,15 +1103,21 @@ class VisualizerGUI:
         # the GUI only ever reacted to percent-progress lines, so long
         # stretches with no percent output (audio analysis, schedule
         # building) made the whole export look stalled even while it was
-        # genuinely working.
+        # genuinely working. This runs on a background thread, so use the
+        # log file directly rather than routing through root.after.
+        _log_debug(f"Watcher thread started for pid={proc.pid}")
         pct_re = re.compile(r"(\d+(?:\.\d+)?)%")
         last_line = ""
         all_lines: list[str] = []
+        got_any_output = False
         try:
             for raw_line in proc.stdout:
                 line = raw_line.strip()
                 if not line:
                     continue
+                if not got_any_output:
+                    got_any_output = True
+                    _log_debug("First line of worker output received -- worker is alive.")
                 last_line = line
                 all_lines.append(line)
                 del all_lines[:-60]  # keep only the tail -- enough context without unbounded growth
@@ -1054,9 +1127,11 @@ class VisualizerGUI:
                     self.root.after(0, lambda p=pct, l=line: self._update_render_progress(p, l))
                 else:
                     self.root.after(0, lambda l=line: self.status_var.set(l))
-        except Exception:
-            pass
+        except Exception as e:
+            _log_debug(f"Watcher thread exception while reading worker stdout: {e!r}")
         proc.wait()
+        _log_debug(f"Worker pid={proc.pid} exited with code {proc.returncode}. "
+                   f"got_any_output={got_any_output}. last_line={last_line!r}")
         try:
             os.remove(cfg_path)
         except OSError:
@@ -1066,20 +1141,30 @@ class VisualizerGUI:
         self.root.after(0, lambda: self._render_done(ok, out_path, last_line, full_output))
 
     def _render_done(self, ok: bool, out_path: str, last_line: str, full_output: str = ""):
-        self._close_export_dialog()
+        _log_debug(f"_render_done: ok={ok} canceled={self._render_canceled} out_path={out_path}")
+        try:
+            self._close_export_dialog()
+        except Exception as e:
+            _log_debug(f"_close_export_dialog raised (non-fatal): {e!r}")
         self.render_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self._render_proc = None
         if ok:
             self.progress_var.set(100)
             self.status_var.set(f"Done! Saved to {out_path}")
-            messagebox.showinfo("Render complete", f"Your video is ready:\n{out_path}")
+            try:
+                messagebox.showinfo("Render complete", f"Your video is ready:\n{out_path}")
+            except Exception as e:
+                _log_debug(f"showinfo raised (non-fatal): {e!r}")
         elif self._render_canceled:
             self.status_var.set("Export canceled.")
         else:
             self.status_var.set("Export failed.")
             detail = full_output.strip() or last_line or "(no output was captured from the export process)"
-            messagebox.showerror("Export failed", f"Something went wrong during export.\n\nDetails:\n{detail}")
+            try:
+                messagebox.showerror("Export failed", f"Something went wrong during export.\n\nDetails:\n{detail}")
+            except Exception as e:
+                _log_debug(f"showerror raised (non-fatal): {e!r}")
 
     def _cancel_render(self):
         if self._render_proc and self._render_proc.poll() is None:
