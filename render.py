@@ -191,17 +191,32 @@ def main(argv=None):
     seed = args.seed if args.seed is not None else np.random.randint(0, 1_000_000)
     chaos = args.chaos if args.chaos is not None else 0.65
 
-    # if a snippet range was requested, losslessly trim the WAV first --
-    # everything downstream (analysis + the audio ffmpeg muxes in) then
-    # just works off this shorter file without any further changes
-    wav_path = args.wav
+    # Copy the input WAV to a local temp file up front, and work off that
+    # copy for everything from here on (analysis AND the final ffmpeg
+    # mux). Reading directly, repeatedly, over many seconds from a path
+    # inside a cloud-synced folder is risky the same way writing to one
+    # is -- OneDrive in particular silently syncs "Desktop" and
+    # "Documents" on Windows by default, can mark files "cloud-only" and
+    # fetch them on demand, and its sync client can interfere with a file
+    # while something else is mid-read. A single upfront copy means the
+    # rest of the run never touches the original path again, regardless
+    # of where the user's WAV actually lives.
+    local_wav_fd, local_wav_path = tempfile.mkstemp(suffix=".wav", prefix="y2k_input_")
+    os.close(local_wav_fd)
+    print(f"      copying input WAV to a local temp file (source may be cloud-synced): {args.wav}")
+    shutil.copyfile(args.wav, local_wav_path)
+
+    # if a snippet range was requested, losslessly trim the (now-local) WAV
+    # first -- everything downstream (analysis + the audio ffmpeg muxes in)
+    # then just works off this shorter file without any further changes
+    wav_path = local_wav_path
     tmp_trim_path = None
     if args.start is not None or args.end is not None:
         start = max(0.0, args.start or 0.0)
         end = args.end
         fd, tmp_trim_path = tempfile.mkstemp(suffix=".wav", prefix="y2k_snippet_")
         os.close(fd)
-        trim_wav(args.wav, start, end, tmp_trim_path)
+        trim_wav(local_wav_path, start, end, tmp_trim_path)
         wav_path = tmp_trim_path
         end_label = f"{end:.1f}s" if end is not None else "end"
         print(f"      using snippet {start:.1f}s -> {end_label} of {args.wav}")
@@ -248,11 +263,9 @@ def main(argv=None):
         print(f"      {line}")
 
     if args.dry_run:
+        _cleanup_tmp(local_wav_path)
         if tmp_trim_path:
-            try:
-                os.remove(tmp_trim_path)
-            except OSError:
-                pass
+            _cleanup_tmp(tmp_trim_path)
         print("Dry run complete (no video rendered).")
         return 0
 
@@ -311,21 +324,29 @@ def main(argv=None):
                 rate = (i + 1) / elapsed if elapsed > 0 else 0
                 print(f"      {pct:5.1f}%  frame {i+1}/{feat.n_frames}  "
                       f"({rate:.1f} fps render speed, pattern={pattern})", end="\r", flush=True)
-    except BrokenPipeError:
+    except (BrokenPipeError, OSError) as e:
+        # Windows doesn't reliably raise BrokenPipeError for a dead pipe --
+        # it can surface as a plain OSError (commonly errno 22, "Invalid
+        # argument") instead, which the original `except BrokenPipeError`
+        # here didn't catch. That let the real reason ffmpeg died (visible
+        # in its own stderr) get lost behind an unhelpful, unexplained
+        # Python-side traceback. Catch both, and always show ffmpeg's own
+        # stderr -- that's the actual diagnostic information.
         stderr = proc.stderr.read().decode(errors="ignore")
-        print("\nffmpeg pipe broke. ffmpeg stderr:\n" + stderr, file=sys.stderr)
+        print(f"\nffmpeg pipe broke ({e!r}). ffmpeg stderr:\n" + stderr, file=sys.stderr)
         _cleanup_tmp(tmp_out_path)
+        _cleanup_tmp(local_wav_path)
+        if tmp_trim_path:
+            _cleanup_tmp(tmp_trim_path)
         return 1
     finally:
         if proc.stdin:
             proc.stdin.close()
 
     ret = proc.wait()
+    _cleanup_tmp(local_wav_path)
     if tmp_trim_path:
-        try:
-            os.remove(tmp_trim_path)
-        except OSError:
-            pass
+        _cleanup_tmp(tmp_trim_path)
     if ret != 0:
         stderr = proc.stderr.read().decode(errors="ignore")
         print(f"\nffmpeg exited with code {ret}:\n{stderr}", file=sys.stderr)
@@ -361,6 +382,8 @@ def main(argv=None):
 
 
 def _cleanup_tmp(path: str):
+    if not path:
+        return
     try:
         os.remove(path)
     except OSError:
