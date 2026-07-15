@@ -153,6 +153,9 @@ class VisualizerGUI:
         self.status_var = tk.StringVar(value="Pick a WAV file to get started.")
 
         self._render_proc: subprocess.Popen | None = None
+        self._render_canceled = False
+        self._export_dialog: tk.Toplevel | None = None
+        self.progress_var = tk.DoubleVar(value=0.0)
 
         # ---- live preview machinery -----------------------------------
         self.preview_states: dict[str, dict] = {name: {} for name in PATTERN_NAMES}
@@ -163,10 +166,42 @@ class VisualizerGUI:
         self.preview_photo = None
 
         self._preview_after_id = None
+        self._install_global_exception_guard()
         self._build_layout()
         self._wire_color_reset_traces()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick_preview()
+
+    def _install_global_exception_guard(self):
+        # A packaged, windowed (console=False) build has nowhere for an
+        # unhandled exception in a Tkinter callback to go -- by default
+        # Tk just prints a traceback to stderr, and stderr doesn't exist
+        # for a windowed app with no console attached. That makes any bug
+        # here (e.g. the export subprocess failing to even launch) look
+        # exactly like "nothing happens": the button greys out, and then
+        # silently nothing ever follows up. This guard makes sure any such
+        # failure always surfaces as a visible error dialog instead.
+        import traceback as _tb
+
+        def handler(exc_type, exc_value, exc_tb):
+            details = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+            try:
+                self.status_var.set(f"Unexpected error: {exc_value}")
+            except Exception:
+                pass
+            try:
+                self._close_export_dialog()
+                self.render_button.configure(state="normal")
+                self.cancel_button.configure(state="disabled")
+            except Exception:
+                pass
+            try:
+                messagebox.showerror("Unexpected error",
+                                      f"Something went wrong:\n\n{exc_value}\n\n{details[-1500:]}")
+            except Exception:
+                pass
+
+        self.root.report_callback_exception = handler
 
     def _on_close(self):
         if self._preview_after_id is not None:
@@ -286,7 +321,8 @@ class VisualizerGUI:
                                         bg="#3a2440", fg=FG, relief="flat", padx=10, pady=8, state="disabled")
         self.cancel_button.pack(side="left", padx=8)
 
-        self.progress = ttk.Progressbar(bottom, orient="horizontal", mode="determinate", maximum=100)
+        self.progress = ttk.Progressbar(bottom, orient="horizontal", mode="determinate", maximum=100,
+                                         variable=self.progress_var)
         self.progress.pack(side="left", fill="x", expand=True, padx=12)
 
         status = tk.Label(self.root, textvariable=self.status_var, bg=BG, fg="#b9a8d9", anchor="w")
@@ -890,14 +926,6 @@ class VisualizerGUI:
                 cfg["start"] = round(self.snippet_start, 2)
                 cfg["end"] = round(self.snippet_end, 2)
 
-        fd, cfg_path = tempfile.mkstemp(suffix=".json", prefix="y2k_gui_config_")
-        with os.fdopen(fd, "w") as fh:
-            json.dump(cfg, fh, indent=2)
-
-        self._stop_playback()
-        self.render_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
-        self.progress.configure(value=0)
         # make it unambiguous whether the trim selection is actually being
         # used, since that was previously invisible at export time
         if trimmed:
@@ -905,19 +933,101 @@ class VisualizerGUI:
                           f"of {_format_time(self.wav_duration)})")
         else:
             range_note = " (using the full track)"
-        self.status_var.set(f"Exporting -> {out_path}{range_note} -- starting...")
+        start_msg = f"Exporting -> {out_path}{range_note} -- starting..."
 
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        proc = subprocess.Popen(
-            _render_subprocess_cmd(cfg_path),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-            creationflags=creationflags,
-        )
+        # Everything from here on can fail in ways that used to vanish
+        # completely (a packaged, windowed exe has no console for an
+        # unhandled exception to print to) -- wrap it all so any failure,
+        # even one before the worker process exists, always surfaces as a
+        # visible error instead of the button just quietly re-enabling
+        # itself (or not) with no explanation.
+        try:
+            fd, cfg_path = tempfile.mkstemp(suffix=".json", prefix="y2k_gui_config_")
+            with os.fdopen(fd, "w") as fh:
+                json.dump(cfg, fh, indent=2)
+
+            self._render_canceled = False
+            self._stop_playback()
+            self.render_button.configure(state="disabled")
+            self.cancel_button.configure(state="normal")
+            self.progress_var.set(0)
+            self.status_var.set(start_msg)
+            self._open_export_dialog()
+
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            proc = subprocess.Popen(
+                _render_subprocess_cmd(cfg_path),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                creationflags=creationflags,
+            )
+        except Exception as e:
+            self._close_export_dialog()
+            self.render_button.configure(state="normal")
+            self.cancel_button.configure(state="disabled")
+            self.status_var.set(f"Export failed to start: {e}")
+            messagebox.showerror("Export failed to start", f"Couldn't start the export process:\n\n{e}")
+            return
+
         self._render_proc = proc
         threading.Thread(target=self._watch_render, args=(proc, cfg_path, out_path), daemon=True).start()
+        # if the worker never prints a single line within a few seconds
+        # (hung process, blocked by AV, crashed before Python even started
+        # up) let the user know something's off instead of leaving the
+        # modal sitting on "starting..." forever with no explanation
+        self.root.after(8000, lambda p=proc: self._check_export_stalled(p))
+
+    def _check_export_stalled(self, proc: subprocess.Popen):
+        if self._render_proc is not proc or proc.poll() is not None:
+            return  # already finished, canceled, or superseded
+        if self.status_var.get().endswith("-- starting..."):
+            self.status_var.set(
+                "Still starting... this can take a while for the first launch "
+                "(or if antivirus is scanning the app). Hang tight, or hit Cancel export.")
+
+    def _open_export_dialog(self):
+        if self._export_dialog is not None:
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Exporting Video")
+        dlg.configure(bg=PANEL_BG)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        # block the window-manager close button while export is running --
+        # Cancel export is the only way out, so an export in progress can
+        # never be "lost track of" behind the main window
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        tk.Label(dlg, text="Exporting your video -- please wait.", bg=PANEL_BG, fg=FG,
+                 font=("TkDefaultFont", 11, "bold")).pack(padx=18, pady=(18, 6))
+        tk.Label(dlg, textvariable=self.status_var, bg=PANEL_BG, fg="#b9a8d9",
+                 wraplength=420, justify="left", anchor="w").pack(padx=18, fill="x")
+        ttk.Progressbar(dlg, orient="horizontal", mode="determinate", maximum=100,
+                         variable=self.progress_var, length=420).pack(padx=18, pady=14)
+        tk.Button(dlg, text="Cancel export", command=self._cancel_render,
+                  bg="#3a2440", fg=FG, relief="flat", padx=12, pady=6).pack(pady=(0, 16))
+
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        dlg.geometry(f"{w}x{h}+{rx + max(0, (rw - w) // 2)}+{ry + max(0, (rh - h) // 2)}")
+
+        self._export_dialog = dlg
+        dlg.grab_set()  # modal -- blocks all interaction with the main window until this closes
+        dlg.focus_set()
+
+    def _close_export_dialog(self):
+        dlg = self._export_dialog
+        if dlg is not None:
+            try:
+                dlg.grab_release()
+                dlg.destroy()
+            except Exception:
+                pass
+            self._export_dialog = None
 
     def _update_render_progress(self, pct: float, line: str):
-        self.progress.configure(value=pct)
+        self.progress_var.set(pct)
         self.status_var.set(line)
 
     def _watch_render(self, proc: subprocess.Popen, cfg_path: str, out_path: str):
@@ -929,12 +1039,15 @@ class VisualizerGUI:
         # genuinely working.
         pct_re = re.compile(r"(\d+(?:\.\d+)?)%")
         last_line = ""
+        all_lines: list[str] = []
         try:
             for raw_line in proc.stdout:
                 line = raw_line.strip()
                 if not line:
                     continue
                 last_line = line
+                all_lines.append(line)
+                del all_lines[:-60]  # keep only the tail -- enough context without unbounded growth
                 m = pct_re.search(line)
                 if m:
                     pct = float(m.group(1))
@@ -949,24 +1062,30 @@ class VisualizerGUI:
         except OSError:
             pass
         ok = proc.returncode == 0
-        self.root.after(0, lambda: self._render_done(ok, out_path, last_line))
+        full_output = "\n".join(all_lines)
+        self.root.after(0, lambda: self._render_done(ok, out_path, last_line, full_output))
 
-    def _render_done(self, ok: bool, out_path: str, last_line: str):
+    def _render_done(self, ok: bool, out_path: str, last_line: str, full_output: str = ""):
+        self._close_export_dialog()
         self.render_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self._render_proc = None
         if ok:
-            self.progress.configure(value=100)
+            self.progress_var.set(100)
             self.status_var.set(f"Done! Saved to {out_path}")
             messagebox.showinfo("Render complete", f"Your video is ready:\n{out_path}")
+        elif self._render_canceled:
+            self.status_var.set("Export canceled.")
         else:
-            self.status_var.set("Render failed or was canceled — see terminal for details.")
-            messagebox.showerror("Render failed", f"Something went wrong.\n\nLast output line:\n{last_line}")
+            self.status_var.set("Export failed.")
+            detail = full_output.strip() or last_line or "(no output was captured from the export process)"
+            messagebox.showerror("Export failed", f"Something went wrong during export.\n\nDetails:\n{detail}")
 
     def _cancel_render(self):
         if self._render_proc and self._render_proc.poll() is None:
+            self._render_canceled = True
             self._render_proc.terminate()
-            self.status_var.set("Canceling render...")
+            self.status_var.set("Canceling export...")
 
 
 def main():
