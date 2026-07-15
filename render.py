@@ -137,7 +137,18 @@ def make_ffmpeg_process(out_path: str, wav_path: str, w: int, h: int, fps: float
         "-shortest",
         out_path,
     ]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    # ffmpeg.exe is a console-subsystem program. This render worker itself
+    # has no console (it was launched with CREATE_NO_WINDOW), so without
+    # explicitly suppressing it here too, Windows auto-allocates a brand
+    # new, VISIBLE console window for ffmpeg to attach to -- popping open
+    # what looks like a random black terminal every single export. Worse,
+    # that window defaults to "QuickEdit mode", where a single click
+    # inside it freezes the process until Enter is pressed -- a very
+    # plausible reason the pipe to it was breaking mid-render. Same fix as
+    # the worker launch in gui.py: CREATE_NO_WINDOW keeps it fully hidden.
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             creationflags=creationflags)
 
 
 def main(argv=None):
