@@ -29,9 +29,16 @@ def add_glow(base: Image.Image, glow_layer: Image.Image, radius: int, strength: 
 
 
 def make_polar_grids(w: int, h: int):
-    """Precompute per-pixel radius/angle grids centered on the canvas, cached by size."""
+    """Precompute per-pixel radius/angle grids centered on the canvas, cached by size.
+
+    float32 rather than numpy's default float64: these grids feed every
+    polar-pattern's per-frame elementwise math (chrome_tunnel, checker_tunnel,
+    etc), so halving their memory footprint roughly halves the memory
+    bandwidth (and therefore wall-clock cost) of all of that downstream math,
+    for no visible difference at 8-bit output precision.
+    """
     cx, cy = w / 2.0, h / 2.0
-    ys, xs = np.mgrid[0:h, 0:w]
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
     dx = xs - cx
     dy = ys - cy
     r = np.sqrt(dx * dx + dy * dy)
@@ -106,11 +113,18 @@ def build_palette_lut(colors, size: int = 512) -> np.ndarray:
 
 
 def sample_lut(lut: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Sample a palette LUT (size,3) at fractional positions t (any shape, any range) -> (...,3) uint8."""
+    """Sample a palette LUT (size,3) at fractional positions t (any shape, any range) -> (...,3) uint8.
+
+    Uses np.take(..., mode='wrap') to fuse the wraparound + gather into a
+    single pass instead of separate mod/multiply/astype/clip passes -- this
+    is a hot path (called every frame on a full-resolution array by several
+    patterns) and the two implementations are numerically identical for all
+    inputs (verified against the previous np.mod-based version across large
+    negative/positive ranges, fractional values, and boundary cases).
+    """
     size = lut.shape[0]
-    idx = (np.mod(t, 1.0) * size).astype(np.int32)
-    idx = np.clip(idx, 0, size - 1)
-    return lut[idx]
+    idx = np.floor(t * size).astype(np.int64)
+    return lut.take(idx, axis=0, mode='wrap')
 
 
 # --------------------------------------------------------------------------
