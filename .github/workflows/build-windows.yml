@@ -4,12 +4,16 @@ name: Build Windows Installer
 # free GitHub-hosted Windows runner -- nobody needs an actual Windows
 # machine to produce a release build.
 #
-#   - push to main / manual run  -> installer is attached as a downloadable
-#                                   build artifact on the workflow run page
-#   - push a tag like "v1.0.0"   -> the above, PLUS a GitHub Release is
-#                                   published with Kami-Setup.exe attached,
-#                                   so there's a stable download link to
-#                                   hand out (repo's Releases page)
+#   - every push to main   -> installer is attached as a downloadable build
+#                              artifact on the workflow run page, AND the
+#                              rolling "latest" GitHub Release is replaced
+#                              with this build, so the repo's
+#                              /releases/latest link is *always* current --
+#                              no need to remember to tag a version just to
+#                              get a fresh download link out.
+#   - push a tag "v1.0.0"  -> the above, PLUS a proper versioned Release
+#                              (e.g. "v1.0.0") is published for anyone who
+#                              wants a stable, pinned version to link to.
 
 on:
   push:
@@ -67,7 +71,23 @@ jobs:
           name: Kami-Setup
           path: dist_installer\Kami-Setup.exe
 
-      - name: Publish GitHub Release
+      - name: Publish rolling "latest" release (always current with main)
+        # This is what makes the Releases page a trustworthy "always the
+        # newest build" link -- every single push to main replaces this
+        # release's asset, instead of only updating on a manually-tagged
+        # version (which is easy to forget, and silently leaves the
+        # Releases page pointing at a stale, possibly-broken old build).
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest "dist_installer/Kami-Setup.exe" \
+            --title "Kami -- latest build" \
+            --notes "Automated build from the newest main branch commit (${{ github.sha }}). This link always points at the most recent Kami-Setup.exe. Download it, run it, and follow the installer -- no separate Python or ffmpeg install needed."
+
+      - name: Publish versioned GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:

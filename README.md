@@ -13,11 +13,13 @@ ffmpeg. Audio analysis is done directly from the WAV file (no librosa).
 
 ## Just want to use it? (Windows)
 
-Grab **Kami-Setup.exe** from the project's GitHub Releases page, run it,
-and follow the installer. It doesn't ask for admin rights, adds a Start
-Menu entry and (optionally) a desktop shortcut, and bundles its own copy
-of ffmpeg — nothing else to install. This is what you'd hand to someone
-who just wants to use the app, not edit its code.
+Grab **Kami-Setup.exe** from the project's GitHub Releases page (the
+`latest` release — it's always the newest build, updated automatically on
+every push to `main`), run it, and follow the installer. It doesn't ask
+for admin rights, adds a Start Menu entry and (optionally) a desktop
+shortcut, and bundles its own copy of ffmpeg — nothing else to install.
+This is what you'd hand to someone who just wants to use the app, not edit
+its code.
 
 If you're setting this repo up for the first time and don't have a
 Releases page yet, see **Building the Windows installer** near the bottom
@@ -302,14 +304,19 @@ There's a one-time setup step, then it's automatic from there on.
 
 **Every time after that:**
 
-- Push a normal commit to `main` -> a fresh installer builds automatically;
-  grab it from the **Actions** tab on that run.
+- Push a normal commit to `main` -> a fresh installer builds automatically
+  AND is published to the repo's **Releases** page as the `latest` release,
+  replacing whatever installer was there before. This is the link to hand
+  out or re-download from when testing a fix — `https://github.com/<you>/<repo>/releases/latest`
+  always has the newest build, no extra steps needed.
 - Push a version tag (e.g. `git tag v1.0.0 && git push origin v1.0.0`) ->
-  same build, PLUS it's published to the repo's **Releases** page with the
-  installer attached. That Releases page is what you'd link people to —
-  it's a stable URL that always points at the latest `Kami-Setup.exe`,
-  unlike an Actions artifact link (which requires a GitHub login to
-  download and expires after 90 days).
+  same build, PLUS a second, separate *versioned* Release (e.g. `v1.0.0`)
+  is published for anyone who wants a stable, pinned version to link to
+  instead of a constantly-moving `latest`.
+- (Every push also still attaches the installer as a plain **Actions**
+  artifact on that run, if you want it without touching Releases at all —
+  but that requires a GitHub login and expires after 90 days, so Releases
+  is the better link to actually hand out.)
 
 To bump the version number that shows up in the installer (Programs and
 Features, the installer's title bar), edit `MyAppVersion` in
