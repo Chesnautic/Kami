@@ -59,6 +59,18 @@ def _format_time(seconds: float) -> str:
     m, s = divmod(int(round(seconds)), 60)
     return f"{m}:{s:02d}"
 
+
+def _default_output_path(wav_path: str) -> str:
+    # Default exports to the Desktop instead of wherever the source WAV
+    # happens to live -- easy to find regardless of how deeply nested the
+    # source file's own folder is (e.g. a "self produced [Stems]" project
+    # folder several levels into OneDrive).
+    base = os.path.splitext(os.path.basename(wav_path))[0] + "_y2k.mp4"
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    if os.path.isdir(desktop):
+        return os.path.join(desktop, base)
+    return os.path.join(os.path.dirname(os.path.abspath(wav_path)), base)
+
 PREVIEW_W, PREVIEW_H = 480, 270
 PREVIEW_FPS = 18
 N_GRADIENT_SWATCHES = 5
@@ -675,7 +687,7 @@ class VisualizerGUI:
         self.wav_path = path
         self.wav_label.configure(text=os.path.basename(path))
         if not self.out_path_var.get().strip():
-            self.out_path_var.set(path.rsplit(".", 1)[0] + "_y2k.mp4")
+            self.out_path_var.set(_default_output_path(path))
         self.status_var.set("Analyzing audio...")
         self._stop_playback()
         self.wav_duration = 0.0
@@ -903,8 +915,16 @@ class VisualizerGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _pick_output(self):
-        path = filedialog.asksaveasfilename(title="Save video as", defaultextension=".mp4",
-                                             filetypes=[("MP4 video", "*.mp4")])
+        current = self.out_path_var.get().strip()
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        initialdir = os.path.dirname(current) if current else (desktop if os.path.isdir(desktop) else None)
+        initialfile = os.path.basename(current) if current else ""
+        kwargs = dict(title="Save video as", defaultextension=".mp4", filetypes=[("MP4 video", "*.mp4")])
+        if initialdir:
+            kwargs["initialdir"] = initialdir
+        if initialfile:
+            kwargs["initialfile"] = initialfile
+        path = filedialog.asksaveasfilename(**kwargs)
         if path:
             self.out_path_var.set(path)
 
@@ -998,7 +1018,7 @@ class VisualizerGUI:
             messagebox.showwarning("No patterns", "Enable at least one pattern.")
             return
 
-        out_path = self.out_path_var.get().strip() or (self.wav_path.rsplit(".", 1)[0] + "_y2k.mp4")
+        out_path = self.out_path_var.get().strip() or _default_output_path(self.wav_path)
         seed = None
         if self.seed_var.get().strip():
             try:

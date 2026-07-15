@@ -313,6 +313,7 @@ def main(argv=None):
 
     t0 = time.time()
     dt = 1.0 / fps
+    last_print = t0
     try:
         for i in range(feat.n_frames):
             pattern = schedule[i]
@@ -329,12 +330,25 @@ def main(argv=None):
 
             proc.stdin.write(img.tobytes())
 
-            if i % max(1, int(fps * 2)) == 0:
-                elapsed = time.time() - t0
+            # Wall-clock-paced progress updates instead of every-Nth-frame --
+            # a frame-count checkpoint (e.g. "every 60 frames") goes quiet
+            # for longer and longer stretches of real time as rendering
+            # slows down, which is exactly backwards: slow renders are
+            # when you most need reassurance it's still moving. This way
+            # the GUI gets a fresh line at least once a second no matter
+            # how fast or slow any given pattern is, plus an ETA so a
+            # genuinely slow-but-healthy render doesn't read as "stuck".
+            now = time.time()
+            if now - last_print >= 1.0 or i == feat.n_frames - 1:
+                last_print = now
+                elapsed = now - t0
                 pct = (i + 1) / feat.n_frames * 100
                 rate = (i + 1) / elapsed if elapsed > 0 else 0
+                remaining = feat.n_frames - (i + 1)
+                eta = remaining / rate if rate > 0 else 0
                 print(f"      {pct:5.1f}%  frame {i+1}/{feat.n_frames}  "
-                      f"({rate:.1f} fps render speed, pattern={pattern})", end="\r", flush=True)
+                      f"({rate:.1f} fps render speed, ~{eta:.0f}s remaining, pattern={pattern})",
+                      flush=True)
     except (BrokenPipeError, OSError) as e:
         # Windows doesn't reliably raise BrokenPipeError for a dead pipe --
         # it can surface as a plain OSError (commonly errno 22, "Invalid
