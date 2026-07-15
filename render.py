@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -269,8 +270,22 @@ def main(argv=None):
     pattern_rng = {name: np.random.default_rng(seed + i * 7919) for i, name in enumerate(PATTERN_NAMES)}
     ctrl_dict = controls.as_dict()
 
+    # Render to an isolated local temp file first, then move the FINISHED
+    # file into place at out_path as the very last step. Writing directly
+    # into out_path is risky if it's inside a cloud-synced folder --
+    # OneDrive in particular very often silently syncs "Desktop" and
+    # "Documents" on Windows by default -- because the sync client can
+    # grab/lock/upload the file while ffmpeg is still actively writing to
+    # it over many seconds, which can truncate or corrupt it (missing moov
+    # atom = "file was never properly finalized" is the classic symptom).
+    # A single move of an already-complete file avoids that whole class of
+    # bug regardless of where out_path actually points.
+    tmp_out_fd, tmp_out_path = tempfile.mkstemp(suffix=".mp4", prefix="y2k_render_out_")
+    os.close(tmp_out_fd)
+    os.remove(tmp_out_path)  # ffmpeg needs to create this file itself
+
     print(f"[3/3] Rendering {feat.n_frames} frames at {w}x{h}@{fps}fps -> {out_path}")
-    proc = make_ffmpeg_process(out_path, wav_path, w, h, fps)
+    proc = make_ffmpeg_process(tmp_out_path, wav_path, w, h, fps)
 
     t0 = time.time()
     dt = 1.0 / fps
@@ -299,6 +314,7 @@ def main(argv=None):
     except BrokenPipeError:
         stderr = proc.stderr.read().decode(errors="ignore")
         print("\nffmpeg pipe broke. ffmpeg stderr:\n" + stderr, file=sys.stderr)
+        _cleanup_tmp(tmp_out_path)
         return 1
     finally:
         if proc.stdin:
@@ -313,10 +329,42 @@ def main(argv=None):
     if ret != 0:
         stderr = proc.stderr.read().decode(errors="ignore")
         print(f"\nffmpeg exited with code {ret}:\n{stderr}", file=sys.stderr)
+        _cleanup_tmp(tmp_out_path)
+        return 1
+
+    # Sanity-check the rendered file before trusting it -- a file that's
+    # missing or implausibly tiny for the frame count means something went
+    # wrong even though ffmpeg reported success (e.g. it got killed by
+    # something outside our control right at the very end).
+    try:
+        size = os.path.getsize(tmp_out_path)
+    except OSError:
+        size = 0
+    if size < 4096:
+        print(f"\nRendered file is suspiciously small ({size} bytes) -- treating this as a failure "
+              f"rather than handing over a broken video.", file=sys.stderr)
+        _cleanup_tmp(tmp_out_path)
+        return 1
+
+    try:
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        shutil.move(tmp_out_path, out_path)
+    except Exception as e:
+        print(f"\nRender finished ok, but couldn't move it to {out_path}: {e}\n"
+              f"The finished video is sitting at: {tmp_out_path}", file=sys.stderr)
         return 1
 
     print(f"\nDone in {time.time()-t0:.1f}s -> {out_path}")
     return 0
+
+
+def _cleanup_tmp(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
