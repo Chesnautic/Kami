@@ -1181,12 +1181,23 @@ class VisualizerGUI:
                 last_line = line
                 all_lines.append(line)
                 del all_lines[:-60]  # keep only the tail -- enough context without unbounded growth
+                # Log EVERY line from the worker, not just milestones --
+                # this is what previously made the debug log show only a
+                # single last_line (often just the tail of a multi-line
+                # ffmpeg error) while the actually-useful detail only ever
+                # existed transiently in the failure messagebox. Skip pure
+                # frame-percent spam (the \r-driven per-frame progress
+                # line) so the log doesn't fill up with hundreds of
+                # near-identical lines during a normal render.
                 m = pct_re.search(line)
                 if m:
                     pct = float(m.group(1))
                     self.root.after(0, lambda p=pct, l=line: self._update_render_progress(p, l))
+                    if "frame" not in line:
+                        _log_debug(f"[worker] {line}")
                 else:
                     self.root.after(0, lambda l=line: self.status_var.set(l))
+                    _log_debug(f"[worker] {line}")
         except Exception as e:
             _log_debug(f"Watcher thread exception while reading worker stdout: {e!r}")
         proc.wait()
