@@ -1092,6 +1092,7 @@ class VisualizerGUI:
                                       f"(full details also saved to kami_debug.log next to Kami.exe)")
             except Exception:
                 pass
+            self._open_debug_log()
             return
 
         self._render_proc = proc
@@ -1216,17 +1217,42 @@ class VisualizerGUI:
             except Exception as e:
                 _log_debug(f"showinfo raised (non-fatal): {e!r}")
         elif self._render_canceled:
-            self.status_var.set("Export canceled.")
+            self.status_var.set("Export canceled. Opening the debug log...")
+            self._open_debug_log()
         else:
-            self.status_var.set("Export failed.")
+            self.status_var.set("Export failed. Opening the debug log...")
             detail = full_output.strip() or last_line or "(no output was captured from the export process)"
             try:
                 messagebox.showerror("Export failed", f"Something went wrong during export.\n\nDetails:\n{detail}")
             except Exception as e:
                 _log_debug(f"showerror raised (non-fatal): {e!r}")
+            self._open_debug_log()
+
+    def _open_debug_log(self):
+        # Pull up kami_debug.log automatically on any non-success outcome
+        # (canceled or failed) instead of making the user go hunt for it
+        # by hand every single time -- the point of the file is fast
+        # iteration, and that only works if it's actually easy to reach.
+        existing = [p for p in DEBUG_LOG_PATHS if os.path.isfile(p)]
+        target = existing[0] if existing else None
+        if not target:
+            _log_debug("Tried to auto-open the debug log, but no candidate log file exists yet.")
+            return
+        _log_debug(f"Auto-opening debug log for the user: {target}")
+        try:
+            if os.name == "nt":
+                try:
+                    subprocess.Popen(["notepad.exe", target])
+                except Exception:
+                    os.startfile(target)  # falls back to whatever .log is associated with
+            else:
+                subprocess.Popen(["xdg-open", target])
+        except Exception as e:
+            _log_debug(f"Failed to auto-open debug log (non-fatal): {e!r}")
 
     def _cancel_render(self):
         if self._render_proc and self._render_proc.poll() is None:
+            _log_debug("Cancel export clicked by user.")
             self._render_canceled = True
             self._render_proc.terminate()
             self.status_var.set("Canceling export...")
