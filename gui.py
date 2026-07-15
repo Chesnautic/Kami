@@ -149,14 +149,39 @@ def _style_scale(scale: ttk.Scale):
     scale.configure(length=200)
 
 
+def _fit_geometry_to_screen(root: tk.Tk, want_w: int, want_h: int, min_w: int, min_h: int) -> str:
+    # A hardcoded "1180x780" opens off the bottom of the screen on smaller
+    # displays or with a taskbar/scaling eating into the usable area -- as
+    # happened here, hiding the entire bottom row (Export/Cancel/progress)
+    # below the visible screen with no obvious sign anything was missing.
+    # Clamp the requested size to whatever's actually available and center
+    # it, so the whole window -- title bar to bottom edge -- is guaranteed
+    # on-screen no matter the display.
+    root.update_idletasks()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    w = max(min_w, min(want_w, sw - 60))
+    h = max(min_h, min(want_h, sh - 120))  # leave room for the taskbar + title bar
+    x = max(0, (sw - w) // 2)
+    y = max(0, (sh - h) // 3)  # slightly above center reads better than dead-center
+    return f"{w}x{h}+{x}+{y}"
+
+
 class VisualizerGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Kami — Y2K Chaotic Music Visualizer")
-        root.geometry("1180x780")
         root.minsize(1000, 680)
+        root.geometry(_fit_geometry_to_screen(root, 1180, 780, 1000, 680))
         root.configure(bg=BG)
         self._set_window_icon(root)
+        # Belt-and-suspenders on Windows: start maximized so the window is
+        # *never* partially off-screen, regardless of screen size or DPI
+        # scaling quirks the geometry math above didn't anticipate. Still
+        # a normal, resizable/restorable window -- just starts full-size.
+        try:
+            root.state("zoomed")
+        except tk.TclError:
+            pass
 
         self._init_style()
 
