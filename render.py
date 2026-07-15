@@ -26,12 +26,14 @@ Run `python3 render.py --list-patterns` to see all available patterns.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -149,6 +151,55 @@ def make_ffmpeg_process(out_path: str, wav_path: str, w: int, h: int, fps: float
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                              creationflags=creationflags)
+
+
+class _StderrDrain:
+    """Continuously drains a subprocess's stderr pipe in a background thread.
+
+    ffmpeg writes a steady stream of progress/stats text to stderr for as
+    long as it runs. If nothing reads that pipe, the OS pipe buffer
+    eventually fills up -- a render long enough to matter produces easily
+    enough text to hit this, especially on Windows where the default
+    anonymous-pipe buffer is much smaller than on Linux -- and ffmpeg
+    blocks trying to write more of it. That in turn blocks *us* forever in
+    proc.wait(), since ffmpeg can never get to exiting. This is a real,
+    reproducible Python subprocess deadlock (see the "Popen.wait()" warning
+    in the subprocess docs), and it looks exactly like a render silently
+    hanging forever right at "0s remaining" -- all frames get written and
+    the last progress line prints fine, but the process never actually
+    finishes. Draining continuously here (keeping only the last N lines,
+    which is all we need for diagnostics if something does go wrong)
+    avoids the deadlock entirely, regardless of how much stderr ffmpeg
+    produces over the life of a render.
+    """
+
+    def __init__(self, pipe, max_lines: int = 2000):
+        self._pipe = pipe
+        self._lines = collections.deque(maxlen=max_lines)
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            for line in iter(self._pipe.readline, b""):
+                with self._lock:
+                    self._lines.append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                self._pipe.close()
+            except Exception:
+                pass
+
+    def text(self) -> str:
+        with self._lock:
+            lines = list(self._lines)
+        return b"".join(lines).decode(errors="ignore")
+
+    def join(self, timeout: float = 2.0):
+        self._thread.join(timeout=timeout)
 
 
 def main(argv=None):
@@ -310,6 +361,7 @@ def main(argv=None):
 
     print(f"[3/3] Rendering {feat.n_frames} frames at {w}x{h}@{fps}fps -> {out_path}")
     proc = make_ffmpeg_process(tmp_out_path, wav_path, w, h, fps)
+    stderr_drain = _StderrDrain(proc.stderr)
 
     t0 = time.time()
     dt = 1.0 / fps
@@ -357,7 +409,8 @@ def main(argv=None):
         # in its own stderr) get lost behind an unhelpful, unexplained
         # Python-side traceback. Catch both, and always show ffmpeg's own
         # stderr -- that's the actual diagnostic information.
-        stderr = proc.stderr.read().decode(errors="ignore")
+        stderr_drain.join()
+        stderr = stderr_drain.text()
         print(f"\nffmpeg pipe broke ({e!r}). ffmpeg stderr:\n" + stderr, file=sys.stderr)
         _cleanup_tmp(tmp_out_path)
         _cleanup_tmp(local_wav_path)
@@ -369,11 +422,12 @@ def main(argv=None):
             proc.stdin.close()
 
     ret = proc.wait()
+    stderr_drain.join()
     _cleanup_tmp(local_wav_path)
     if tmp_trim_path:
         _cleanup_tmp(tmp_trim_path)
     if ret != 0:
-        stderr = proc.stderr.read().decode(errors="ignore")
+        stderr = stderr_drain.text()
         print(f"\nffmpeg exited with code {ret}:\n{stderr}", file=sys.stderr)
         _cleanup_tmp(tmp_out_path)
         return 1
