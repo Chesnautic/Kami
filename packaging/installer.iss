@@ -12,7 +12,7 @@
 ;   ..\dist_installer\Kami-Setup.exe
 
 #define MyAppName "Kami"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Kami"
 #define MyAppExeName "Kami.exe"
 
