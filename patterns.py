@@ -1726,6 +1726,497 @@ def render_crt_boot(w, h, feat, local_t, rng, pal, ctrl, state):
     return upscale_pixelated(img, w, h)
 
 
+# ==========================================================================
+# PACK 5 — WAVEFORMS II — 8 new scenes, deliberately built on different
+# rendering techniques than every pattern above (radial bars instead of
+# linear, an implicit metaball field instead of polar rings, cellular-
+# automaton fire propagation, wave-interference cymatics, a parametric XY
+# scope trace, analog needle dials, event-driven sonar rings, and a
+# grid-automaton snake) so this pack reads as genuinely new rather than a
+# palette-swapped remix of pack 1.
+# ==========================================================================
+def render_radial_spectrum(w, h, feat, local_t, rng, pal, ctrl, state):
+    # Same idea as equalizer_bars (bass/mid/treble mapped across a row of
+    # bars) but wrapped around a circle instead of laid out left-to-right,
+    # slowly rotating -- a radial spectrum analyzer rather than a linear one.
+    #
+    # add_glow's blur cost scales with pixel count, and 64 bars worth of
+    # neon glow doesn't need full-resolution precision -- same downsample-
+    # then-upscale trick as kaleidoscope/sonar_ping, working the whole
+    # drawing at half resolution and upscaling once at the end.
+    chaos = ctrl["chaos"]
+    glow_strength = ctrl.get("glow_strength", 1.0)
+    scale = 0.5
+    rw, rh = max(2, round(w * scale)), max(2, round(h * scale))
+    cx, cy = rw / 2, rh / 2
+    R = min(rw, rh) * 0.5
+    inner_r = R * 0.22
+    max_extra = R * 0.62
+
+    n_bars = state.setdefault("n_bars", 64)
+    phases = state.setdefault("phases", rng.uniform(0, 10, n_bars))
+    rot = state.get("rot", 0.0) + (0.06 + feat["mid"] * 0.25) * (1 / 30.0)
+    state["rot"] = rot
+
+    img = Image.new("RGB", (rw, rh), pal["bg"])
+    draw = ImageDraw.Draw(img)
+    glow_layer = Image.new("RGB", (rw, rh), (0, 0, 0))
+    gdraw = ImageDraw.Draw(glow_layer)
+
+    colors = pal["colors"]
+    for j in range(n_bars):
+        pos = j / n_bars
+        if pos < 0.4:
+            band = feat["bass"] * (1 - pos / 0.4) + feat["mid"] * (pos / 0.4)
+        elif pos < 0.7:
+            local = (pos - 0.4) / 0.3
+            band = feat["mid"] * (1 - local) + feat["treble"] * local * 0.6
+        else:
+            local = (pos - 0.7) / 0.3
+            band = feat["treble"] * (0.6 + 0.4 * local)
+
+        wiggle = 0.55 + 0.45 * np.sin(local_t * 2.2 + phases[j])
+        spike = feat["onset"] * (1.2 if feat["is_beat"] else 0.4)
+        bar_len = max_extra * clamp(band * wiggle + spike * 0.5, 0.03, 1.3) * (0.6 + 0.4 * chaos)
+
+        ang = pos * 2 * np.pi + rot
+        ca, sa = np.cos(ang), np.sin(ang)
+        x0, y0 = cx + inner_r * ca, cy + inner_r * sa
+        x1, y1 = cx + (inner_r + bar_len) * ca, cy + (inner_r + bar_len) * sa
+        col = colors[j % len(colors)]
+        width = max(1, int(2 * np.pi * (inner_r + bar_len) / n_bars * 0.6))
+        draw.line([(x0, y0), (x1, y1)], fill=col, width=width)
+        gdraw.line([(x0, y0), (x1, y1)], fill=col, width=width)
+
+    draw.ellipse([cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r], outline=pal["accent"], width=2)
+    glowed = add_glow(img, glow_layer, radius=max(1, round(6 * scale)), strength=0.6 * glow_strength)
+    if (rw, rh) != (w, h):
+        glowed = glowed.resize((w, h), Image.BILINEAR)
+    return glowed
+
+
+def render_liquid_chrome(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A handful of bouncing "metaballs" -- an implicit scalar field built by
+    # summing 1/distance^2 falloffs from each blob center -- thresholded and
+    # colored through the palette LUT so blobs visibly merge/split into a
+    # single liquid-chrome surface as they get close, rather than being
+    # separately drawn shapes like kaleidoscope's blobs.
+    #
+    # Same downsample-then-upscale trick as kaleidoscope/sonar_ping: the
+    # field is a handful of full-frame numpy passes (one per blob), which
+    # doesn't need full pixel precision for a soft liquid surface, so the
+    # whole simulation runs at half resolution and the final image is
+    # upscaled once with a bilinear resize.
+    chaos = ctrl["chaos"]
+    scale = 0.5
+    rw, rh = max(2, round(w * scale)), max(2, round(h * scale))
+    xs, ys = cartesian_grids(rw, rh)
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+
+    n_blobs = 5
+    blobs = state.setdefault("blobs", [
+        dict(x=rng.uniform(0.2, 0.8) * rw, y=rng.uniform(0.2, 0.8) * rh,
+             vx=rng.uniform(-1, 1) * 46 * scale, vy=rng.uniform(-1, 1) * 46 * scale,
+             r=rng.uniform(0.09, 0.16) * min(rw, rh))
+        for _ in range(n_blobs)
+    ])
+    dt = 1 / 30.0
+    speed_mul = 1.0 + feat["mid"] * 0.8 + (0.6 if feat["is_beat"] else 0.0)
+    for b in blobs:
+        b["x"] += b["vx"] * dt * speed_mul
+        b["y"] += b["vy"] * dt * speed_mul
+        if b["x"] < b["r"] or b["x"] > rw - b["r"]:
+            b["vx"] *= -1
+            b["x"] = clamp(b["x"], b["r"], rw - b["r"])
+        if b["y"] < b["r"] or b["y"] > rh - b["r"]:
+            b["vy"] *= -1
+            b["y"] = clamp(b["y"], b["r"], rh - b["r"])
+
+    field = np.zeros((rh, rw), dtype=np.float32)
+    for b in blobs:
+        dx = xs - b["x"]
+        dy = ys - b["y"]
+        r2 = dx * dx + dy * dy + 1.0
+        rad = b["r"] * (1.0 + feat["bass"] * 0.35)
+        field += (rad * rad) / r2
+
+    thresh = 1.0 + chaos * 0.4
+    hue_t = field * 0.35 - thresh * 0.14 + local_t * 0.04
+    color = sample_lut(lut, hue_t).astype(np.float32)
+    edge = np.exp(-((field - thresh) ** 2) / 0.06)  # bright rim where the field crosses threshold
+    brightness = np.clip(0.18 + 0.55 * np.clip(field / thresh, 0, 1) + edge * 0.9, 0, 1.9)
+    img_arr = np.clip(color * brightness[..., None], 0, 255).astype(np.uint8)
+    img = Image.fromarray(img_arr, "RGB")
+    if (rw, rh) != (w, h):
+        img = img.resize((w, h), Image.BILINEAR)
+    return img
+
+
+def render_sonar_ping(w, h, feat, local_t, rng, pal, ctrl, state):
+    # Event-driven expanding rings (spawned on beats/onsets, not a
+    # continuously-scrolling tunnel like chrome_tunnel) plus a rotating
+    # radar sweep wedge, on a dark scope backdrop with faint static range
+    # rings for atmosphere.
+    #
+    # Profiled at full resolution: the per-ring accumulation and add_glow's
+    # blur are both full-frame numpy/PIL passes, and neither needs
+    # full-resolution precision for a bunch of soft glowing rings -- so,
+    # same technique as kaleidoscope's fix earlier this project, build the
+    # whole scope at half internal resolution and upscale once with a
+    # bilinear resize at the end. That's ~4x fewer pixels through every
+    # expensive step below for output that reads as identical once the
+    # glow blur softens it anyway.
+    glow_strength = ctrl.get("glow_strength", 1.0)
+    scale = 0.5
+    rw, rh = max(2, round(w * scale)), max(2, round(h * scale))
+    r, theta = polar_grids(rw, rh)
+    R = min(rw, rh) * 0.5
+
+    # The faint background range rings never change frame to frame (they
+    # only depend on r, which is itself constant for a given canvas size),
+    # so build that base once and reuse it -- recomputing several
+    # full-frame Gaussian falloffs every single frame for something that
+    # never actually changes was most of this pattern's cost. Also use a
+    # cheap linear "tent" falloff (clip/abs) instead of exp() for the ring
+    # profile -- add_glow's blur afterward softens either shape the same
+    # way, so the exp()'s extra cost bought nothing visible.
+    static_base = state.get("static_base")
+    if static_base is None or static_base.shape[:2] != (rh, rw):
+        bg = pal["bg"]
+        accent = pal["accent"]
+        base = np.empty((rh, rw, 3), dtype=np.float32)
+        base[..., 0] = bg[0]
+        base[..., 1] = bg[1]
+        base[..., 2] = bg[2]
+        ring_band = max(1.0, R * 0.012)
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            ring = np.clip(1.0 - np.abs(r - R * frac) / ring_band, 0.0, 1.0)
+            ring *= 0.16
+            base[..., 0] += ring * accent[0]
+            base[..., 1] += ring * accent[1]
+            base[..., 2] += ring * accent[2]
+        static_base = base
+        state["static_base"] = static_base
+
+    img_arr = static_base.copy()
+
+    pings = state.setdefault("pings", [])
+    spawn = feat["is_beat"] or feat["onset"] > 0.65 or rng.random() < 0.01 + feat["rms"] * 0.02
+    if spawn and (not pings or pings[-1]["r"] > R * 0.12):
+        pings.append(dict(r=0.0, col=pal["colors"][rng.integers(0, len(pal["colors"]))]))
+    dt = 1 / 30.0
+    speed = R * (0.55 + feat["rms"] * 0.5)
+    alive = []
+    for p in pings:
+        p["r"] += speed * dt
+        if p["r"] < R * 1.15:
+            alive.append(p)
+    alive = alive[-4:]  # a sonar screen rarely shows more than a few rings at once
+    state["pings"] = alive
+
+    # Accumulate per color channel (img_arr[..., c] += ring * col[c]) rather
+    # than building a (h,w,3) intermediate via ring[..., None] * col --
+    # profiled: the broadcast version was ~2x the cost of this for no
+    # visual difference, since it allocates a full extra RGB-sized array
+    # per ring rather than reusing the plain (h,w) ring mask 3 times.
+    band = R * 0.025
+    for p in alive:
+        ring = np.clip(1.0 - np.abs(r - p["r"]) / band, 0.0, 1.0)
+        fade = clamp(1.0 - p["r"] / (R * 1.15), 0.0, 1.0)
+        ring *= 1.4 * fade
+        col = p["col"]
+        img_arr[..., 0] += ring * col[0]
+        img_arr[..., 1] += ring * col[1]
+        img_arr[..., 2] += ring * col[2]
+
+    rot = state.get("sweep", 0.0) + (0.8 + feat["mid"] * 1.2) * dt
+    state["sweep"] = rot % (2 * np.pi)
+    d = (theta - rot) % (2 * np.pi)
+    d = np.minimum(d, 2 * np.pi - d)
+    sweep_mask = np.clip(1.0 - d / 0.9, 0, 1) ** 2
+    sweep_mask *= 0.5
+    accent = pal["accent"]
+    img_arr[..., 0] += sweep_mask * accent[0]
+    img_arr[..., 1] += sweep_mask * accent[1]
+    img_arr[..., 2] += sweep_mask * accent[2]
+
+    img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
+    img = Image.fromarray(img_arr, "RGB")
+    glowed = add_glow(img, img, radius=max(1, round(6 * scale)), strength=0.5 * glow_strength)
+    if (rw, rh) != (w, h):
+        glowed = glowed.resize((w, h), Image.BILINEAR)
+    return glowed
+
+
+def render_vu_meters(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A bank of retro analog VU-meter dials (bass/mid/treble), each with a
+    # smoothed swinging needle and a tick-marked arc face -- an audio-gear
+    # look this app hasn't done yet (cd_burn_spin is a spinning disc, not
+    # gauges).
+    #
+    # add_glow's blur is a full-frame pass regardless of how little is
+    # actually drawn on it -- same downsample-then-upscale trick as the
+    # other new patterns above.
+    glow_strength = ctrl.get("glow_strength", 1.0)
+    scale = 0.5
+    rw, rh = max(2, round(w * scale)), max(2, round(h * scale))
+    bands = [feat["bass"], feat["mid"], feat["treble"]]
+    n = len(bands)
+
+    img = Image.new("RGB", (rw, rh), pal["bg"])
+    draw = ImageDraw.Draw(img)
+    glow_layer = Image.new("RGB", (rw, rh), (0, 0, 0))
+    gdraw = ImageDraw.Draw(glow_layer)
+
+    margin = rw * 0.08
+    dial_w = (rw - margin * 2) / n
+    R = min(dial_w * 0.42, rh * 0.32)
+    cy = rh * 0.62
+    colors = pal["colors"]
+
+    needles = state.setdefault("needles", [0.0] * n)
+    for i in range(n):
+        cx = margin + dial_w * (i + 0.5)
+        target = clamp(bands[i], 0.0, 1.3)
+        needles[i] += (target - needles[i]) * 0.35  # smoothed swing, not an instant snap
+        frac = clamp(needles[i] / 1.3, 0.0, 1.0)
+        angle_deg = 200 + frac * 140
+        ang = np.radians(angle_deg)
+
+        draw.arc([cx - R, cy - R, cx + R, cy + R], 200, 340, fill=pal["accent"], width=3)
+        for tick in range(9):
+            ta = np.radians(200 + tick * (340 - 200) / 8)
+            x0, y0 = cx + R * 0.82 * np.cos(ta), cy + R * 0.82 * np.sin(ta)
+            x1, y1 = cx + R * np.cos(ta), cy + R * np.sin(ta)
+            draw.line([(x0, y0), (x1, y1)], fill=(200, 200, 210), width=2)
+
+        col = colors[i % len(colors)]
+        nx, ny = cx + R * 0.86 * np.cos(ang), cy + R * 0.86 * np.sin(ang)
+        draw.line([(cx, cy), (nx, ny)], fill=col, width=3)
+        gdraw.line([(cx, cy), (nx, ny)], fill=col, width=3)
+        draw.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill=(230, 230, 235))
+        if feat["is_beat"]:
+            draw.arc([cx - R * 1.05, cy - R * 1.05, cx + R * 1.05, cy + R * 1.05], 200, 340, fill=col, width=2)
+
+    state["needles"] = needles
+    glowed = add_glow(img, glow_layer, radius=max(1, round(7 * scale)), strength=0.5 * glow_strength)
+    if (rw, rh) != (w, h):
+        glowed = glowed.resize((w, h), Image.BILINEAR)
+    return glowed
+
+
+def render_lissajous_scope(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A classic oscilloscope "XY mode" Lissajous figure: two sine waves
+    # plotted against each other (x from one frequency, y from another)
+    # instead of oscilloscope_wave's linear y-vs-time trace. Forms loops
+    # and rosette shapes that redraw fresh every frame as the phase drifts.
+    # add_glow's blur is a full-frame pass regardless of the vector line
+    # work above it -- same downsample-then-upscale trick as the other new
+    # patterns in this pack.
+    chaos = ctrl["chaos"]
+    glow_strength = ctrl.get("glow_strength", 1.0)
+    scale = 0.5
+    rw, rh = max(2, round(w * scale)), max(2, round(h * scale))
+    cx, cy = rw / 2, rh / 2
+    R = min(rw, rh) * 0.38
+
+    a = state.setdefault("a", 3)
+    b = state.setdefault("b", 2)
+    if feat["is_drop"] and rng.random() < 0.5:
+        a = state["a"] = int(rng.integers(2, 6))
+        b = state["b"] = int(rng.integers(2, 6))
+
+    n_pts = 260
+    tt = np.linspace(0, 2 * np.pi, n_pts)
+    phase = local_t * (0.4 + feat["mid"] * 0.6)
+    wobble = chaos * 0.4 * np.sin(local_t * 1.7)
+    xs = cx + R * (0.75 + 0.25 * feat["bass"]) * np.sin(a * tt + phase + wobble)
+    ys = cy + R * (0.75 + 0.25 * feat["treble"]) * np.sin(b * tt + phase * 1.3)
+
+    img = Image.new("RGB", (rw, rh), pal["bg"])
+    draw = ImageDraw.Draw(img)
+    glow_layer = Image.new("RGB", (rw, rh), (0, 0, 0))
+    gdraw = ImageDraw.Draw(glow_layer)
+
+    col = pal["colors"][int(local_t * 1.5) % len(pal["colors"])]
+    pts = list(zip(xs.tolist(), ys.tolist()))
+    width = max(1, round((3 if feat["is_beat"] else 2) * scale))
+    draw.line(pts, fill=col, width=width, joint="curve")
+    gdraw.line(pts, fill=col, width=width, joint="curve")
+
+    hx, hy = pts[-1]
+    s = max(1.0, (4 + (3 if feat["is_beat"] else 0)) * scale)
+    draw.ellipse([hx - s, hy - s, hx + s, hy + s], fill=(255, 255, 255))
+    gdraw.ellipse([hx - s, hy - s, hx + s, hy + s], fill=(255, 255, 255))
+    glowed = add_glow(img, glow_layer, radius=max(1, round(8 * scale)), strength=0.75 * glow_strength)
+    if (rw, rh) != (w, h):
+        glowed = glowed.resize((w, h), Image.BILINEAR)
+    return glowed
+
+
+def render_demo_fire(w, h, feat, local_t, rng, pal, ctrl, state):
+    # The classic demoscene "propagating fire" algorithm: each row's heat
+    # comes from the row below it, decayed, with a bright audio-reactive
+    # random source seeded along the bottom edge every frame. Vectorized
+    # as one shift-and-decay over the whole frame per tick rather than the
+    # traditional per-pixel loop. A cellular-automaton technique nothing
+    # else in this app uses.
+    #
+    # Each pixel pulls from ONE randomly-offset neighbor directly below it
+    # (-1, 0, or +1 column) rather than a blend of all three -- a plain
+    # average of left/right/below smooths horizontal variance away within
+    # a few rows, washing the whole thing out into flat horizontal bands
+    # instead of the flickering vertical flame tongues a fire should have.
+    # The random per-pixel pick is what lets noise injected at the bottom
+    # drift and streak upward instead of getting averaged out.
+    #
+    # Simulated on a small pixel_canvas-style grid (like pixel_snake/
+    # cd_burn_spin above) rather than a half-res 640x360-ish grid: at that
+    # finer resolution the per-pixel random walk just reads as fine TV
+    # static, since one column's luck-of-the-draw only ever differs from
+    # its neighbor's by a pixel or two out of hundreds. Shrinking the grid
+    # so each simulated cell is a visible multi-pixel block (classic
+    # chunky demoscene fire look) makes that same random walk actually
+    # visible as separate licking flame tongues of different heights, and
+    # is cheaper besides.
+    chaos = ctrl["chaos"]
+    scale = max(1, round(w / 160))
+    rw, rh = max(2, w // scale), max(2, h // scale)
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+    heat = state.get("heat")
+    if heat is None or heat.shape != (rh, rw):
+        heat = np.zeros((rh, rw), dtype=np.float32)
+        state["heat"] = heat
+
+    # Each frame the flame only climbs by one row, so how far up the frame
+    # it visibly reaches is governed by how many rows of decay it survives
+    # before hitting zero -- an absolute row count, NOT a fraction of the
+    # working height. A fixed per-row cooling rate (as a naive port of the
+    # classic algorithm would use) therefore makes the flame reach the
+    # same ~handful of rows regardless of canvas height: a couple of
+    # visible pixels on a 720-tall frame, let alone a 1920-tall portrait
+    # export. Scaling cooling by 1/rh keeps the flame's reach a roughly
+    # constant fraction of the frame (~40%) at any resolution.
+    cooling = (1051.0 / rh) * (0.65 + chaos * 0.85)
+    below = heat[1:]
+    # roll+where is a fair bit cheaper than the equivalent take_along_axis
+    # gather (measured ~25% faster at 720p) for the same per-pixel random
+    # left/center/right pick.
+    pick = rng.integers(0, 3, size=below.shape)
+    left = np.roll(below, 1, axis=1)
+    right = np.roll(below, -1, axis=1)
+    src = np.where(pick == 0, left, np.where(pick == 1, below, right))
+    decay = rng.uniform(0.0, cooling, size=below.shape).astype(np.float32)
+    heat[:-1] = np.clip(src - decay, 0.0, 255.0)
+
+    base = 140.0 + feat["rms"] * 90.0 + (60.0 if feat["is_beat"] else 0.0)
+    noise = rng.uniform(0.0, 60.0, size=(rw,)).astype(np.float32)
+    heat[-1] = np.clip(base + noise, 0, 255)
+
+    t = heat / 255.0
+    color = sample_lut(lut, t * 0.85).astype(np.float32)
+    brightness = np.clip(0.15 + t * 1.15, 0, 1.3)
+    img_arr = np.clip(color * brightness[..., None], 0, 255).astype(np.uint8)
+    img = Image.fromarray(img_arr, "RGB")
+    if (rw, rh) != (w, h):
+        img = upscale_pixelated(img, w, h)
+    return img
+
+
+def render_cymatics_ripple(w, h, feat, local_t, rng, pal, ctrl, state):
+    # Chladni-plate-style standing wave interference: a few fixed point
+    # sources each radiate cos(distance * freq - phase), summed together --
+    # where waves reinforce you get bright bands, where they cancel you get
+    # dark nodal lines, the way sand settles on a vibrating plate. Distinct
+    # wave-interference math from chrome_tunnel's single-center rings.
+    #
+    # Same downsample-then-upscale trick as the other new field-based
+    # patterns above: the interference field is a few full-frame numpy
+    # passes that don't need full pixel precision, so this runs at half
+    # resolution. freq is compensated by 1/scale so the ripple wavelength
+    # (in real, on-screen terms) comes out the same regardless of the
+    # internal working resolution.
+    chaos = ctrl["chaos"]
+    scale = 0.5
+    rw, rh = max(2, round(w * scale)), max(2, round(h * scale))
+    xs, ys = cartesian_grids(rw, rh)
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+
+    n_src = 3
+    sources = state.setdefault("sources", [
+        dict(x=rng.uniform(0.25, 0.75) * rw, y=rng.uniform(0.25, 0.75) * rh,
+             freq=rng.uniform(0.045, 0.075))
+        for _ in range(n_src)
+    ])
+
+    phase = local_t * (1.1 + feat["mid"] * 1.3)
+    field = np.zeros((rh, rw), dtype=np.float32)
+    for i, s in enumerate(sources):
+        dx = xs - s["x"]
+        dy = ys - s["y"]
+        dist = np.sqrt(dx * dx + dy * dy)
+        freq = (s["freq"] / scale) * (1.0 + feat["bass"] * 0.5 + chaos * 0.3)
+        field += np.cos(dist * freq - phase - i * 0.7)
+
+    field = field * (1.6 if feat["is_beat"] else 1.0)
+    t = (field / n_src) * 0.5 + 0.5 + local_t * 0.02
+    color = sample_lut(lut, t).astype(np.float32)
+    brightness = np.clip(0.25 + np.abs(field) / n_src * 0.9, 0, 1.4)
+    img_arr = np.clip(color * brightness[..., None], 0, 255).astype(np.uint8)
+    img = Image.fromarray(img_arr, "RGB")
+    if (rw, rh) != (w, h):
+        img = img.resize((w, h), Image.BILINEAR)
+    return img
+
+
+def render_pixel_snake(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A literal "Snake" game homage: a chunky pixel trail crawls across a
+    # small grid, wrapping at the edges and occasionally turning (more
+    # often as chaos/beats spike), growing/shrinking its tail length with
+    # treble. A grid-automaton mechanic that's a first for this app -- every
+    # other pattern moves in continuous space, not discrete grid cells.
+    img, draw, iw, ih, scale = pixel_canvas(w, h, pal["bg"], target_width=48)
+    cols, rows = iw, ih
+
+    if "snake" not in state:
+        state["snake"] = [(cols // 2, rows // 2)]
+        state["dir"] = (1, 0)
+        state["cooldown"] = 0.0
+        state["max_len"] = 22
+
+    snake = state["snake"]
+    dirx, diry = state["dir"]
+    cooldown = state["cooldown"] - (1 / 30.0)
+    move_every = clamp(0.16 - feat["rms"] * 0.09, 0.045, 0.2)
+
+    if cooldown <= 0:
+        cooldown = move_every
+        turn_chance = 0.12 + ctrl["chaos"] * 0.25 + (0.35 if feat["is_beat"] else 0.0)
+        if rng.random() < turn_chance:
+            dirx, diry = (-diry, dirx) if rng.random() < 0.5 else (diry, -dirx)
+            state["dir"] = (dirx, diry)
+        hx, hy = snake[-1]
+        nx, ny = (hx + dirx) % cols, (hy + diry) % rows
+        snake.append((nx, ny))
+        max_len = state["max_len"] + int(feat["treble"] * 8)
+        while len(snake) > max_len:
+            snake.pop(0)
+    state["cooldown"] = cooldown
+
+    colors = pal["colors"]
+    n = len(snake)
+    for i, (gx, gy) in enumerate(snake):
+        t = i / max(1, n - 1)
+        col = colors[i % len(colors)]
+        fade = 0.35 + 0.65 * t
+        c = tuple(int(v * fade) for v in col)
+        draw.rectangle([gx, gy, gx, gy], fill=c)
+
+    hx, hy = snake[-1]
+    draw.rectangle([hx, hy, hx, hy], fill=(255, 255, 255))
+    return upscale_pixelated(img, w, h)
+
+
 PATTERN_REGISTRY = {
     # pack 1: waveforms
     "chrome_tunnel": render_chrome_tunnel,
@@ -1761,6 +2252,15 @@ PATTERN_REGISTRY = {
     "holo_sticker": render_holo_sticker,
     "chrome_bubble_text": render_chrome_bubble_text,
     "crt_boot": render_crt_boot,
+    # pack 5: waveforms II
+    "radial_spectrum": render_radial_spectrum,
+    "liquid_chrome": render_liquid_chrome,
+    "sonar_ping": render_sonar_ping,
+    "vu_meters": render_vu_meters,
+    "lissajous_scope": render_lissajous_scope,
+    "demo_fire": render_demo_fire,
+    "cymatics_ripple": render_cymatics_ripple,
+    "pixel_snake": render_pixel_snake,
 }
 
 PATTERN_NAMES = list(PATTERN_REGISTRY.keys())
@@ -1774,4 +2274,6 @@ SCENE_PACKS = {
                        "constellations", "aurora_borealis", "meteor_shower", "galaxy_swirl"],
     "retro_y2k": ["pixel_globe", "pixel_bounce", "pixel_rain", "cd_burn_spin",
                   "virtual_pet", "holo_sticker", "chrome_bubble_text", "crt_boot"],
+    "waveforms_ii": ["radial_spectrum", "liquid_chrome", "sonar_ping", "vu_meters",
+                      "lissajous_scope", "demo_fire", "cymatics_ripple", "pixel_snake"],
 }

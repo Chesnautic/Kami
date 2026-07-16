@@ -49,6 +49,7 @@ PACK_TITLES = {
     "cars": "Pack 2 — Pixel Cars",
     "space_sunsets": "Pack 3 — Sunsets & Space",
     "retro_y2k": "Pack 4 — Retro Y2K",
+    "waveforms_ii": "Pack 5 — Waveforms II",
 }
 
 SNIPPET_PREVIEW_SECONDS = 4.0  # length of a "click to preview here" snippet
