@@ -71,8 +71,36 @@ def _default_output_path(wav_path: str) -> str:
         return os.path.join(desktop, base)
     return os.path.join(os.path.dirname(os.path.abspath(wav_path)), base)
 
-PREVIEW_W, PREVIEW_H = 480, 270
 PREVIEW_FPS = 18
+
+# The live preview no longer renders at one fixed size -- it fits the
+# *actual* selected export resolution's aspect ratio inside this bounding
+# box, so picking a vertical Reels/TikTok resolution actually shows a tall
+# portrait preview instead of a landscape one that doesn't represent the
+# real export at all. Chosen so every existing 16:9-ish resolution choice
+# (1920x1080, 1280x720, 854x480, 640x360) still lands on exactly the
+# original 480x270 preview size -- only the two portrait options change
+# what you see.
+PREVIEW_BOX_W, PREVIEW_BOX_H = 480, 400
+
+
+def _parse_wxh(s: str, default=(1280, 720)) -> tuple[int, int]:
+    try:
+        w, h = s.lower().split("x")
+        return max(1, int(w)), max(1, int(h))
+    except Exception:
+        return default
+
+
+def _preview_dims_for(resolution_str: str) -> tuple[int, int]:
+    """Fit `resolution_str`'s aspect ratio inside the PREVIEW_BOX_* bounding
+    box, preserving the export's actual proportions (portrait stays tall
+    and narrow, landscape stays wide and short) instead of always showing
+    a fixed-shape preview that doesn't match what will actually be
+    rendered."""
+    out_w, out_h = _parse_wxh(resolution_str)
+    scale = min(PREVIEW_BOX_W / out_w, PREVIEW_BOX_H / out_h)
+    return max(2, round(out_w * scale)), max(2, round(out_h * scale))
 N_GRADIENT_SWATCHES = 5
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RENDER_SCRIPT = os.path.join(SCRIPT_DIR, "render.py")
@@ -252,6 +280,7 @@ class VisualizerGUI:
         self.preview_pattern = tk.StringVar(value=PATTERN_NAMES[0])
 
         self.resolution = tk.StringVar(value="1280x720")
+        self._preview_size = _preview_dims_for(self.resolution.get())
         self.fps = tk.IntVar(value=30)
         self.seed_var = tk.StringVar(value="")
         self.out_path_var = tk.StringVar(value="")
@@ -626,10 +655,13 @@ class VisualizerGUI:
         out_grid.pack(fill="x", padx=12, pady=12)
 
         ttk.Label(out_grid, text="Resolution:").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Combobox(out_grid, textvariable=self.resolution, state="readonly", width=14,
-                     values=["1920x1080", "1280x720", "854x480", "640x360",
-                             "1080x1920", "720x1280"]).grid(row=0, column=1, sticky="w")
-        ttk.Label(out_grid, text="(1080x1920 / 720x1280 = vertical, for Reels/TikTok/Shorts)",
+        res_combo = ttk.Combobox(out_grid, textvariable=self.resolution, state="readonly", width=14,
+                                  values=["1920x1080", "1280x720", "854x480", "640x360",
+                                          "1080x1920", "720x1280"])
+        res_combo.grid(row=0, column=1, sticky="w")
+        res_combo.bind("<<ComboboxSelected>>", self._on_resolution_changed)
+        ttk.Label(out_grid, text="(1080x1920 / 720x1280 = vertical, for Reels/TikTok/Shorts -- "
+                                  "the live preview below matches whichever shape you pick)",
                   foreground="#8f7fae").grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         ttk.Label(out_grid, text="FPS:").grid(row=1, column=0, sticky="w", pady=4)
@@ -691,7 +723,8 @@ class VisualizerGUI:
                               state="readonly", width=18)
         combo.pack(side="left", padx=8)
 
-        self.preview_canvas = tk.Canvas(parent, width=PREVIEW_W, height=PREVIEW_H,
+        pw, ph = self._preview_size
+        self.preview_canvas = tk.Canvas(parent, width=pw, height=ph,
                                          bg="black", highlightthickness=2, highlightbackground=ACCENT)
         self.preview_canvas.pack(pady=10)
         self.preview_image_id = self.preview_canvas.create_image(0, 0, anchor="nw")
@@ -1012,8 +1045,9 @@ class VisualizerGUI:
         self.preview_local_t[pattern] = self.preview_local_t.get(pattern, 0.0) + dt
         state = self.preview_states.setdefault(pattern, {})
         fn = PATTERN_REGISTRY[pattern]
+        pw, ph = self._preview_size
         try:
-            img = fn(PREVIEW_W, PREVIEW_H, feat, self.preview_local_t[pattern],
+            img = fn(pw, ph, feat, self.preview_local_t[pattern],
                       self.preview_rng, pal, ctrl.as_dict(), state)
             self.preview_photo = ImageTk.PhotoImage(img)
             self.preview_canvas.itemconfig(self.preview_image_id, image=self.preview_photo)
@@ -1021,6 +1055,23 @@ class VisualizerGUI:
             self.status_var.set(f"Preview error in {pattern}: {e}")
 
         self._preview_after_id = self.root.after(int(1000 / PREVIEW_FPS), self._tick_preview)
+
+    def _on_resolution_changed(self, *_):
+        # Resize the live preview to match the newly-picked export
+        # resolution's aspect ratio -- most useful for the vertical
+        # Reels/TikTok options, where a landscape-shaped preview wouldn't
+        # tell you anything about how the actual (portrait) export will
+        # look. Also resets preview state: a couple of patterns
+        # (particle_burst, kaleidoscope's blob layout, etc) cache absolute
+        # pixel positions sized for the old canvas, which would otherwise
+        # look briefly wrong/off-center for a moment at the new size.
+        new_size = _preview_dims_for(self.resolution.get())
+        if new_size == self._preview_size:
+            return
+        self._preview_size = new_size
+        pw, ph = new_size
+        self.preview_canvas.configure(width=pw, height=ph)
+        self._reset_preview_state()
 
     # ------------------------------------------------------------------
     # rendering
