@@ -1,4 +1,6 @@
 """Y2K color palettes. Each is a small set of RGB tuples used across patterns."""
+import colorsys
+import random
 
 PALETTES = {
     "chrome": {
@@ -76,6 +78,46 @@ def build_custom_palette(
     if colors:
         pal["colors"] = [hex_to_rgb(c) for c in colors if c]
     return pal
+
+
+def random_palette(seed: int | None = None) -> dict:
+    """Generate a fresh, good-looking Y2K neon palette: a near-black tinted
+    background plus 5 vivid, varied-hue foreground colors -- used to give
+    the app a new look every launch, on demand via the Randomize button,
+    and anywhere else a one-off scheme is wanted.
+
+    Colors are spaced around the hue wheel using the golden angle
+    (~0.618 of a full turn) rather than pure uniform-random hues -- this is
+    a standard trick for picking N well-separated colors: it spreads them
+    out so consecutive picks never land close together (avoiding a
+    muddy/samey look) without imposing a rigid, obviously-computed pattern
+    like evenly-spaced slices would. High saturation + high value keeps
+    everything reading as bright neon rather than washed out, matching the
+    hand-picked presets above.
+    """
+    rng = random.Random(seed)
+
+    bg_hue = rng.random()
+    bg_r, bg_g, bg_b = colorsys.hsv_to_rgb(bg_hue, rng.uniform(0.35, 0.65), rng.uniform(0.03, 0.09))
+    bg = (int(bg_r * 255), int(bg_g * 255), int(bg_b * 255))
+
+    n = 5
+    golden_angle = 0.6180339887498949
+    base_hue = rng.random()
+    colors = []
+    for i in range(n):
+        hue = (base_hue + i * golden_angle + rng.uniform(-0.04, 0.04)) % 1.0
+        sat = rng.uniform(0.55, 0.95)
+        val = rng.uniform(0.85, 1.0)
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        colors.append((int(r * 255), int(g * 255), int(b * 255)))
+
+    accent = colors[rng.randrange(n)]
+    glow_hue = (base_hue + rng.uniform(0.4, 0.6)) % 1.0
+    gr, gg, gb = colorsys.hsv_to_rgb(glow_hue, rng.uniform(0.5, 0.9), 1.0)
+    glow = (int(gr * 255), int(gg * 255), int(gb * 255))
+
+    return dict(bg=bg, colors=colors, accent=accent, glow=glow)
 
 
 def palette_to_hex_fields(pal: dict) -> dict:

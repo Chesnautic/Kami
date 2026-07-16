@@ -1,8 +1,33 @@
 """Shared rendering helpers used across Y2K visualizer patterns."""
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageChops
+
+_REFERENCE_DIAG = math.hypot(1280, 720)
+
+
+def reach_scale(w: int, h: int) -> float:
+    """How much bigger a few effects' fixed-pixel "reach" (particle travel
+    distance, burst radius, etc) should be for this canvas, relative to the
+    1280x720 landscape frame those constants were originally tuned against.
+
+    A handful of patterns (particle_burst, starburst_pop) pick their spread
+    from an absolute pixel range rather than a fraction of w/h, since
+    "how far should a burst travel" doesn't have an obvious w-or-h-relative
+    answer the way a radius centered on the frame does. That's invisible at
+    the reference resolution, but on a much taller/wider canvas -- notably
+    a 1080x1920 portrait export for Reels/TikTok, whose diagonal is ~1.5x
+    the reference's -- the same fixed pixel reach covers a visibly smaller
+    fraction of the frame, reading as a sparse cluster stuck near the
+    center instead of a proper burst. Scaling by the ratio of diagonals
+    keeps effects covering roughly the same relative footprint at any
+    resolution or aspect ratio, while returning exactly 1.0 (no change at
+    all) at the reference size.
+    """
+    return math.hypot(w, h) / _REFERENCE_DIAG
 
 
 def lerp_color(c1, c2, t):

@@ -33,7 +33,7 @@ import numpy as np
 from PIL import ImageTk
 
 from audio_analysis import analyze, Features, wav_duration, load_waveform_preview, trim_wav
-from palettes import PALETTES, DEFAULT_PALETTE, build_custom_palette, palette_to_hex_fields
+from palettes import PALETTES, DEFAULT_PALETTE, build_custom_palette, palette_to_hex_fields, random_palette
 from patterns import PATTERN_REGISTRY, PATTERN_NAMES, SCENE_PACKS
 from controls import Controls
 
@@ -214,8 +214,17 @@ class VisualizerGUI:
         self._playback_started_at = 0.0  # time.monotonic() when the current playback began
         self._playhead_after_id = None
 
-        self.palette_preset = tk.StringVar(value=DEFAULT_PALETTE)
-        preset_hex = palette_to_hex_fields(PALETTES[DEFAULT_PALETTE])
+        # Start every launch with a fresh random palette rather than always
+        # the same "chrome" default -- the 5 named presets are still one
+        # click away in the dropdown, and the Randomize button re-rolls
+        # another random one anytime. "random" isn't one of PALETTES' own
+        # keys; get_palette()/build_custom_palette() both fall back to
+        # DEFAULT_PALETTE for an unrecognized base name, but that fallback
+        # never actually shows through here since bg/accent/glow/colors are
+        # always explicitly set from the StringVars below, which is what
+        # actually determines the rendered look.
+        self.palette_preset = tk.StringVar(value="random")
+        preset_hex = palette_to_hex_fields(random_palette())
         self.bg_color = tk.StringVar(value=preset_hex["bg"])
         self.accent_color = tk.StringVar(value=preset_hex["accent"])
         self.glow_color = tk.StringVar(value=preset_hex["glow"])
@@ -441,6 +450,7 @@ class VisualizerGUI:
                               state="readonly", width=16)
         combo.pack(side="left", padx=8)
         combo.bind("<<ComboboxSelected>>", self._apply_preset_to_swatches)
+        ttk.Button(row, text="Randomize", command=self._randomize_colors).pack(side="left", padx=(4, 0))
 
         ttk.Label(parent, text="Individual colors override the preset — click a swatch to pick a color.",
                   wraplength=480).pack(anchor="w", **pad)
@@ -476,7 +486,19 @@ class VisualizerGUI:
             self._reset_preview_state()
 
     def _apply_preset_to_swatches(self, *_):
-        fields = palette_to_hex_fields(PALETTES[self.palette_preset.get()])
+        self._apply_palette_fields_to_swatches(palette_to_hex_fields(PALETTES[self.palette_preset.get()]))
+
+    def _randomize_colors(self):
+        # "random" isn't a real entry in the preset dropdown's values list,
+        # but the combobox happily displays it anyway (state="readonly"
+        # only blocks *typing* something not in the list, not setting the
+        # bound variable from code) -- so the dropdown honestly reflects
+        # "this isn't one of the 5 fixed presets" instead of silently still
+        # claiming whatever preset was last selected.
+        self.palette_preset.set("random")
+        self._apply_palette_fields_to_swatches(palette_to_hex_fields(random_palette()))
+
+    def _apply_palette_fields_to_swatches(self, fields: dict):
         self.bg_color.set(fields["bg"])
         self.accent_color.set(fields["accent"])
         self.glow_color.set(fields["glow"])
@@ -605,7 +627,10 @@ class VisualizerGUI:
 
         ttk.Label(out_grid, text="Resolution:").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Combobox(out_grid, textvariable=self.resolution, state="readonly", width=14,
-                     values=["1920x1080", "1280x720", "854x480", "640x360"]).grid(row=0, column=1, sticky="w")
+                     values=["1920x1080", "1280x720", "854x480", "640x360",
+                             "1080x1920", "720x1280"]).grid(row=0, column=1, sticky="w")
+        ttk.Label(out_grid, text="(1080x1920 / 720x1280 = vertical, for Reels/TikTok/Shorts)",
+                  foreground="#8f7fae").grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         ttk.Label(out_grid, text="FPS:").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Spinbox(out_grid, from_=12, to=60, textvariable=self.fps, width=6).grid(row=1, column=1, sticky="w")

@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageOps, ImageFont
 from render_utils import (
     polar_grids, cartesian_grids, build_palette_lut, sample_lut,
     add_glow, star_points, blob_points, clamp, pixel_canvas, upscale_pixelated,
-    hsv_wave_color,
+    hsv_wave_color, reach_scale,
 )
 
 _DEFAULT_FONT = ImageFont.load_default()
@@ -164,10 +164,18 @@ def render_particle_burst(w, h, feat, local_t, rng, pal, ctrl, state):
     if feat["is_drop"]:
         n_spawn += max(1, int((30 + 60 * chaos) * density / 8))
 
+    # particle travel speed is picked from a fixed pixel range tuned against
+    # a 1280x720 frame -- scale it so the burst covers roughly the same
+    # fraction of the frame on any resolution/aspect ratio (see
+    # reach_scale's docstring), most importantly tall portrait exports
+    # where the un-scaled burst reads as a small sparse cluster stuck near
+    # the center instead of actually filling the frame.
+    reach = reach_scale(w, h)
+
     cx, cy = w / 2, h / 2
     for _ in range(n_spawn):
         ang = rng.uniform(0, 2 * np.pi)
-        speed = rng.uniform(80, 420) * (1 + feat["rms"])
+        speed = rng.uniform(80, 420) * (1 + feat["rms"]) * reach
         particles.append(dict(
             x=cx + rng.uniform(-30, 30), y=cy + rng.uniform(-30, 30),
             vx=np.cos(ang) * speed, vy=np.sin(ang) * speed,
@@ -746,9 +754,14 @@ def render_starburst_pop(w, h, feat, local_t, rng, pal, ctrl, state):
     img = Image.fromarray(arr, "RGB")
     draw = ImageDraw.Draw(img)
 
+    # base_r is a fixed pixel range tuned against a 1280x720 frame -- scale
+    # it consistently with particle_burst's reach fix (see reach_scale) so
+    # bursts don't look undersized on a higher-diagonal canvas (portrait
+    # exports especially).
+    reach = reach_scale(w, h)
     bursts = state.setdefault("bursts", [
         dict(x=rng.uniform(0.15, 0.85) * w, y=rng.uniform(0.15, 0.85) * h,
-             base_r=rng.uniform(40, 90), rot=rng.uniform(0, 6.28), speed=rng.uniform(-1, 1),
+             base_r=rng.uniform(40, 90) * reach, rot=rng.uniform(0, 6.28), speed=rng.uniform(-1, 1),
              color=pal["colors"][rng.integers(0, len(pal["colors"]))])
         for _ in range(4)
     ])
