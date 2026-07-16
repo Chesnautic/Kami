@@ -2,13 +2,17 @@
 """
 render.py — Y2K Chaotic Music Visualizer
 
-Turn a WAV file into a chaotic, Y2K-styled visualizer MP4. Analyzes the
-audio (loudness, bass/mid/treble energy, beats, drops) and drives 30
-different generative visual patterns (4 scene packs) that auto-cycle
-with the music (or follow a sequence you specify).
+Turn a song into a chaotic, Y2K-styled visualizer MP4. Accepts a WAV,
+an MP3, or a video file (MP4 and anything else ffmpeg can decode audio
+from -- its audio track is extracted automatically). Analyzes the audio
+(loudness, bass/mid/treble energy, beats, drops) and drives dozens of
+different generative visual patterns (multiple scene packs) that
+auto-cycle with the music (or follow a sequence you specify).
 
 USAGE
     python3 render.py song.wav
+    python3 render.py song.mp3
+    python3 render.py music_video.mp4                         # audio track is extracted
     python3 render.py song.wav --out song_viz.mp4 --chaos 0.8 --palette vapor
     python3 render.py song.wav --preview                     # fast low-res test
     python3 render.py song.wav --patterns chrome_tunnel,glitch_vhs,particle_burst
@@ -53,7 +57,10 @@ def parse_resolution(s: str) -> tuple[int, int]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Y2K chaotic music visualizer renderer")
-    p.add_argument("wav", nargs="?", help="Path to input .wav file")
+    p.add_argument("wav", nargs="?",
+                    help="Path to input audio (.wav, .mp3, ...) or video (.mp4, ...) file -- "
+                         "anything ffmpeg can decode audio from. Non-WAV input has its audio "
+                         "track extracted automatically.")
     p.add_argument("--config", default=None,
                     help="Path to a JSON config (as written by gui.py) providing any/all of the "
                          "options below; explicit CLI flags take precedence over config values")
@@ -126,6 +133,41 @@ def _ffmpeg_path() -> str:
         if os.path.isfile(c):
             return c
     return "ffmpeg"
+
+
+# Extensions accepted straight through with a plain byte copy (no re-encode).
+# Anything else -- mp3, mp4, m4a, mov, and whatever other container/codec
+# ffmpeg can decode -- gets its audio extracted via extract_audio_to_wav
+# instead, so the app isn't limited to literal .wav input.
+_RAW_WAV_EXTS = {".wav"}
+
+
+def extract_audio_to_wav(src_path: str, dst_path: str) -> None:
+    """Decode the audio track of any ffmpeg-readable file (mp3, mp4, m4a,
+    mov, ...) into a plain PCM WAV at dst_path. Used so the app can accept
+    an MP3 or a video file directly instead of requiring a pre-extracted
+    WAV -- everything downstream (analysis, trimming, the final mux) only
+    ever has to deal with WAV either way.
+
+    -vn drops any video stream (irrelevant for an MP4 input, a no-op for
+    audio-only input) so ffmpeg doesn't spend time decoding/copying video
+    it's just going to throw away.
+    """
+    cmd = [
+        _ffmpeg_path(), "-y",
+        "-i", src_path,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+        dst_path,
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, creationflags=creationflags)
+    if result.returncode != 0 or not os.path.isfile(dst_path) or os.path.getsize(dst_path) < 64:
+        raise RuntimeError(
+            f"ffmpeg couldn't extract audio from {src_path!r} (exit code {result.returncode}). "
+            f"This usually means the file has no audio track, or is corrupted.\n\n"
+            f"ffmpeg output:\n{result.stdout}"
+        )
 
 
 def make_ffmpeg_process(out_path: str, wav_path: str, w: int, h: int, fps: float):
@@ -265,8 +307,27 @@ def main(argv=None):
     # of where the user's WAV actually lives.
     local_wav_fd, local_wav_path = tempfile.mkstemp(suffix=".wav", prefix="y2k_input_")
     os.close(local_wav_fd)
-    print(f"      copying input WAV to a local temp file (source may be cloud-synced): {args.wav}")
-    shutil.copyfile(args.wav, local_wav_path)
+    src_ext = os.path.splitext(args.wav)[1].lower()
+    try:
+        if src_ext in _RAW_WAV_EXTS:
+            print(f"      copying input WAV to a local temp file (source may be cloud-synced): {args.wav}")
+            shutil.copyfile(args.wav, local_wav_path)
+        else:
+            # Not a WAV -- an MP3, an MP4 (or any other video with an audio
+            # track), or anything else ffmpeg can decode. Extract its audio
+            # into the same local temp WAV rather than requiring the caller
+            # to have pre-extracted it themselves.
+            print(f"      extracting audio from {args.wav} (not a WAV -- decoding via ffmpeg)")
+            extract_audio_to_wav(args.wav, local_wav_path)
+    except Exception as e:
+        # Consistent with every other failure path in this function: a
+        # clear one-line reason, temp file cleaned up, exit code 1 --
+        # rather than an uncaught exception's raw traceback (which,
+        # unlike everywhere else here, wouldn't even clean up the empty
+        # temp WAV this just created).
+        print(f"\nCouldn't read the input file {args.wav!r}: {e}", file=sys.stderr)
+        _cleanup_tmp(local_wav_path)
+        return 1
 
     # if a snippet range was requested, losslessly trim the (now-local) WAV
     # first -- everything downstream (analysis + the audio ffmpeg muxes in)
@@ -412,6 +473,30 @@ def main(argv=None):
         stderr_drain.join()
         stderr = stderr_drain.text()
         print(f"\nffmpeg pipe broke ({e!r}). ffmpeg stderr:\n" + stderr, file=sys.stderr)
+        _cleanup_tmp(tmp_out_path)
+        _cleanup_tmp(local_wav_path)
+        if tmp_trim_path:
+            _cleanup_tmp(tmp_trim_path)
+        return 1
+    except Exception as e:
+        # A bug triggered by a specific pattern/frame (or anything else
+        # unexpected during rendering) previously propagated straight out
+        # of this function uncaught -- the worker process would just die
+        # with a raw Python traceback and no framing, which on a long
+        # render buries the one useful fact (which pattern, which frame)
+        # in whatever else happened to be in the traceback. Catching it
+        # here makes the failure loud and specific, and lets the worker
+        # exit cleanly (temp files removed, ffmpeg killed) rather than
+        # however an uncaught exception happens to unwind through the
+        # `finally` below and the interpreter shutdown path.
+        import traceback as _tb
+        print(f"\nRender crashed on frame {i + 1}/{feat.n_frames} (pattern={schedule[i]}): {e!r}\n"
+              + _tb.format_exc(), file=sys.stderr)
+        stderr_drain.join()
+        try:
+            proc.kill()
+        except Exception:
+            pass
         _cleanup_tmp(tmp_out_path)
         _cleanup_tmp(local_wav_path)
         if tmp_trim_path:

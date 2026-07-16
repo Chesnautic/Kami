@@ -2,10 +2,12 @@
 """
 gui.py — Kami: the Y2K Chaotic Music Visualizer desktop control panel.
 
-A native Tkinter window (no extra GUI dependencies) for picking a WAV
-file, customizing colors, tuning how strongly the visuals react to
-bass/mid/treble/beats, choosing which patterns are in play, and watching a
-live animated preview before committing to a full render.
+A native Tkinter window (no extra GUI dependencies) for picking a song
+(WAV, MP3, or a video file like MP4 -- its audio track is extracted
+automatically), customizing colors, tuning how strongly the visuals
+react to bass/mid/treble/beats, choosing which patterns are in play,
+and watching a live animated preview before committing to a full
+render.
 
 Run:
     python3 gui.py
@@ -36,6 +38,7 @@ from audio_analysis import analyze, Features, wav_duration, load_waveform_previe
 from palettes import PALETTES, DEFAULT_PALETTE, build_custom_palette, palette_to_hex_fields, random_palette
 from patterns import PATTERN_REGISTRY, PATTERN_NAMES, SCENE_PACKS
 from controls import Controls
+from render import extract_audio_to_wav
 
 try:
     import winsound
@@ -229,6 +232,13 @@ class VisualizerGUI:
 
         # ---- state ---------------------------------------------------
         self.wav_path: str | None = None
+        # The path the user actually picked, which may be an MP3/MP4/etc
+        # rather than a WAV -- kept separately from wav_path (which is
+        # always a real WAV, either the original file or a temp file
+        # extracted from this one) so the label/output-name logic can
+        # keep referring to what the user actually chose.
+        self._source_media_path: str | None = None
+        self._extracted_wav_tmp: str | None = None  # temp WAV from a non-WAV source; cleaned up on replace/close
         self.features: Features | None = None
         self._analysis_token = 0
 
@@ -286,7 +296,7 @@ class VisualizerGUI:
         self.fps = tk.IntVar(value=30)
         self.seed_var = tk.StringVar(value="")
         self.out_path_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="Pick a WAV file to get started.")
+        self.status_var = tk.StringVar(value="Pick a WAV, MP3, or MP4 file to get started.")
 
         self._render_proc: subprocess.Popen | None = None
         self._render_canceled = False
@@ -310,6 +320,33 @@ class VisualizerGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick_preview()
         _log_debug("App window built and preview loop started.")
+
+    def _bring_window_to_front(self):
+        """Restore/raise the main window before showing a modal dialog.
+
+        Export deliberately runs in the background so the user can switch
+        away (to another app, another tab, whatever) while a long render
+        works. If the window is minimized -- or just behind other windows
+        -- when a modal messagebox pops up later (export finished,
+        failed, or an unexpected error occurred), that dialog can end up
+        genuinely unreachable on Windows: not visible, not focused, and
+        not something clicking the taskbar icon can bring forward, since
+        the Tk event loop is blocked inside the modal's own nested loop
+        until it's dismissed. From the user's side the whole app then
+        looks completely frozen and won't even close -- exactly the
+        "had to Task Manager it" failure mode. Deiconifying, lifting, and
+        briefly forcing topmost makes sure the window (and the dialog
+        about to sit on top of it) is actually reachable again first.
+        """
+        try:
+            if self.root.state() == "iconic":
+                self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(300, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except Exception:
+            pass
 
     def _install_global_exception_guard(self):
         # A packaged, windowed (console=False) build has nowhere for an
@@ -338,6 +375,7 @@ class VisualizerGUI:
             except Exception:
                 pass
             try:
+                self._bring_window_to_front()
                 messagebox.showerror("Unexpected error",
                                       f"Something went wrong:\n\n{exc_value}\n\n{details[-1500:]}\n\n"
                                       f"(full details also saved to kami_debug.log next to Kami.exe)")
@@ -366,6 +404,11 @@ class VisualizerGUI:
         if self._snippet_temp_wav:
             try:
                 os.remove(self._snippet_temp_wav)
+            except OSError:
+                pass
+        if self._extracted_wav_tmp:
+            try:
+                os.remove(self._extracted_wav_tmp)
             except OSError:
                 pass
         self.root.destroy()
@@ -417,7 +460,7 @@ class VisualizerGUI:
         top = tk.Frame(self.root, bg=BG)
         top.pack(fill="x", padx=14, pady=(12, 6))
 
-        tk.Button(top, text="Browse WAV...", command=self._pick_wav,
+        tk.Button(top, text="Browse...", command=self._pick_wav,
                   bg=ACCENT, fg="#150015", relief="flat", padx=10, pady=4).pack(side="left")
         self.wav_label = tk.Label(top, text="(no file selected)", bg=BG, fg=FG, anchor="w")
         self.wav_label.pack(side="left", padx=10)
@@ -686,7 +729,7 @@ class VisualizerGUI:
         header.pack(fill="x")
         tk.Label(header, text="Snippet to render:", bg=BG, fg=FG,
                  font=("TkDefaultFont", 9, "bold")).pack(side="left")
-        self.snippet_label = tk.Label(header, text="(load a WAV first)", bg=BG, fg="#8f7fae")
+        self.snippet_label = tk.Label(header, text="(load a file first)", bg=BG, fg="#8f7fae")
         self.snippet_label.pack(side="left", padx=10)
 
         btn_row = tk.Frame(header, bg=BG)
@@ -731,7 +774,7 @@ class VisualizerGUI:
         self.preview_canvas.pack(pady=10)
         self.preview_image_id = self.preview_canvas.create_image(0, 0, anchor="nw")
 
-        note = ("Preview uses your real audio once a WAV is analyzed (loops through it); "
+        note = ("Preview uses your real audio once it's analyzed (loops through it); "
                 "before that it reacts to a simulated 120bpm pulse so you can dial in colors "
                 "and intensity right away.")
         ttk.Label(parent, text=note, wraplength=440, foreground="#8f7fae").pack(anchor="w", pady=(0, 6))
@@ -740,15 +783,29 @@ class VisualizerGUI:
     # WAV loading / analysis
     # ------------------------------------------------------------------
     def _pick_wav(self):
-        path = filedialog.askopenfilename(title="Choose a WAV file",
-                                           filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(
+            title="Choose an audio or video file",
+            filetypes=[
+                ("Audio/video", "*.wav *.mp3 *.mp4 *.m4a *.mov *.flac *.ogg"),
+                ("WAV audio", "*.wav"),
+                ("MP3 audio", "*.mp3"),
+                ("MP4 video", "*.mp4"),
+                ("All files", "*.*"),
+            ])
         if not path:
             return
-        self.wav_path = path
+        self._load_input_file(path)
+
+    def _load_input_file(self, path: str):
+        # bump first so any in-flight extraction/analysis from a
+        # previously-picked file becomes a no-op when it finishes
+        self._analysis_token += 1
+        token = self._analysis_token
+
+        self._source_media_path = path
         self.wav_label.configure(text=os.path.basename(path))
         if not self.out_path_var.get().strip():
             self.out_path_var.set(_default_output_path(path))
-        self.status_var.set("Analyzing audio...")
         self._stop_playback()
         self.wav_duration = 0.0
         self.waveform_env = None
@@ -757,8 +814,71 @@ class VisualizerGUI:
         self.play_selection_btn.configure(state="disabled")
         self.reset_snippet_btn.configure(state="disabled")
         self._draw_waveform()
-        self._analyze_wav_async()
-        self._load_waveform_async()
+
+        old_tmp = self._extracted_wav_tmp
+        self._extracted_wav_tmp = None
+
+        def cleanup_old_tmp():
+            if old_tmp:
+                try:
+                    os.remove(old_tmp)
+                except OSError:
+                    pass
+
+        if os.path.splitext(path)[1].lower() == ".wav":
+            cleanup_old_tmp()
+            self.wav_path = path
+            self.status_var.set("Analyzing audio...")
+            self._analyze_wav_async()
+            self._load_waveform_async()
+            return
+
+        # Not a WAV -- MP3, MP4, or anything else ffmpeg can decode audio
+        # from. Extract it to a temp WAV first (on a background thread --
+        # decoding a whole song/video can take a couple seconds and
+        # shouldn't freeze the UI), then treat that temp WAV exactly like
+        # a picked WAV from here on (analysis, waveform preview, and the
+        # path handed to the export worker all just use it).
+        self.wav_path = None
+        self.status_var.set(f"Extracting audio from {os.path.basename(path)}...")
+
+        def worker():
+            fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="y2k_gui_audio_")
+            os.close(fd)
+            try:
+                extract_audio_to_wav(path, tmp_path)
+            except Exception as e:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                if token != self._analysis_token:
+                    return  # superseded by a newer file pick meanwhile
+                self.root.after(0, cleanup_old_tmp)
+                self.root.after(0, self._bring_window_to_front)
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Couldn't read audio",
+                    f"Couldn't extract audio from this file:\n\n{path}\n\n{e}"))
+                self.root.after(0, lambda: self.status_var.set(
+                    "Pick a WAV, MP3, or MP4 file to get started."))
+                return
+            if token != self._analysis_token:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                return  # a newer file was picked while this was extracting
+
+            def apply():
+                cleanup_old_tmp()
+                self._extracted_wav_tmp = tmp_path
+                self.wav_path = tmp_path
+                self.status_var.set("Analyzing audio...")
+                self._analyze_wav_async()
+                self._load_waveform_async()
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _load_waveform_async(self):
         # decoupled from the heavier _analyze_wav_async STFT pass, so the
@@ -832,12 +952,12 @@ class VisualizerGUI:
                 c.create_line(px, 0, px, ch, fill="#ffe066", width=2)
         else:
             c.create_line(0, mid, cw, mid, fill="#3a2440")
-            c.create_text(cw / 2, ch / 2, text="(load a WAV to see its waveform)", fill="#5a4a6a")
+            c.create_text(cw / 2, ch / 2, text="(load a file to see its waveform)", fill="#5a4a6a")
         self._update_snippet_label()
 
     def _update_snippet_label(self):
         if self.wav_duration <= 0:
-            self.snippet_label.configure(text="(load a WAV first)")
+            self.snippet_label.configure(text="(load a file first)")
             return
         dur = self.snippet_end - self.snippet_start
         self.snippet_label.configure(
@@ -958,6 +1078,7 @@ class VisualizerGUI:
             try:
                 feat = analyze(path, fps=30.0)
             except Exception as e:
+                self.root.after(0, self._bring_window_to_front)
                 self.root.after(0, lambda: messagebox.showerror("Analysis failed", str(e)))
                 self.root.after(0, lambda: self.status_var.set("Audio analysis failed."))
                 return
@@ -1087,8 +1208,8 @@ class VisualizerGUI:
         _log_debug("Export button clicked.")
 
         if not self.wav_path:
-            _log_debug("Export aborted: no WAV file selected.")
-            messagebox.showwarning("No file", "Pick a WAV file first.")
+            _log_debug("Export aborted: no file selected.")
+            messagebox.showwarning("No file", "Pick a WAV, MP3, or MP4 file first.")
             return
         pool = [name for name, var in self.pattern_enabled.items() if var.get()]
         if not pool:
@@ -1185,6 +1306,7 @@ class VisualizerGUI:
             self.cancel_button.configure(state="disabled")
             self.status_var.set(f"Export failed to start: {e}")
             try:
+                self._bring_window_to_front()
                 messagebox.showerror("Export failed to start",
                                       f"Couldn't start the export process:\n\n{e}\n\n"
                                       f"(full details also saved to kami_debug.log next to Kami.exe)")
@@ -1318,6 +1440,15 @@ class VisualizerGUI:
         self.render_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self._render_proc = None
+        # Renders often run long enough that the user switches away to do
+        # something else -- that's the whole point of running it in the
+        # background. Bring the window back before any modal messagebox
+        # below: on Windows, a modal dialog that pops up while its parent
+        # is minimized/backgrounded can end up unreachable (not visible,
+        # not focusable from the taskbar), which blocks the Tk event loop
+        # inside that dialog's own nested loop forever -- the app then
+        # looks completely hung and won't even close normally.
+        self._bring_window_to_front()
         if ok:
             self.progress_var.set(100)
             self.status_var.set(f"Done! Saved to {out_path}")
