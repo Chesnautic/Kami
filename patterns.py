@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageOps, ImageFont
 from render_utils import (
     polar_grids, cartesian_grids, build_palette_lut, sample_lut,
     add_glow, star_points, blob_points, clamp, pixel_canvas, upscale_pixelated,
-    hsv_wave_color, reach_scale,
+    hsv_wave_color, reach_scale, pick_color,
 )
 
 _DEFAULT_FONT = ImageFont.load_default()
@@ -2217,6 +2217,374 @@ def render_pixel_snake(w, h, feat, local_t, rng, pal, ctrl, state):
     return upscale_pixelated(img, w, h)
 
 
+# ==========================================================================
+# PACK 6 — TRIPPY VISUALS — 8 new scenes: mushrooms, eyes, a magic ball,
+# and psychedelic-poster field effects. None of these share a rendering
+# technique with any pattern above: dome+stem toadstool silhouettes with
+# polka-dot caps, multi-instance eye anatomy with independent blink state
+# machines, a vertical cat-slit pupil, a smoke-swirled fortune-telling
+# orb, a per-column melt/drip distortion, recursive branching-fractal
+# line drawing, a differential-rotation (each radius band spins at its
+# own rate) swirl warp, and an overlapping-circle moire grid.
+# ==========================================================================
+def _mushroom_shape(draw, cx, cy, cap_r, stem_h, cap_col, stem_col, dot_col, sway, n_dots=5):
+    """One toadstool: a dome cap (half-ellipse) with a ring of polka dots,
+    sitting on a tapered stem. `sway` shifts the cap sideways relative to
+    the stem base, like it's leaning/breathing in the wind."""
+    stem_w = cap_r * 0.42
+    base_x, base_y = cx, cy
+    top_x, top_y = cx + sway, cy - stem_h
+    draw.polygon([
+        (base_x - stem_w * 0.5, base_y), (base_x + stem_w * 0.5, base_y),
+        (top_x + stem_w * 0.35, top_y), (top_x - stem_w * 0.35, top_y),
+    ], fill=stem_col)
+    cap_cx, cap_cy = top_x, top_y
+    draw.pieslice([cap_cx - cap_r, cap_cy - cap_r, cap_cx + cap_r, cap_cy + cap_r * 0.55],
+                  180, 360, fill=cap_col)
+    for i in range(n_dots):
+        a = (i + 0.5) / n_dots * np.pi + np.pi
+        dx, dy = cap_r * 0.62 * np.cos(a), cap_r * 0.3 * np.sin(a)
+        dr = max(1.0, cap_r * 0.12)
+        draw.ellipse([cap_cx + dx - dr, cap_cy + dy - dr, cap_cx + dx + dr, cap_cy + dy + dr], fill=dot_col)
+
+
+def render_psych_mushrooms(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A little cluster of glowing polka-dot toadstools swaying and
+    # pulsing with the music -- a dome-cap-on-stem silhouette nothing
+    # else in this app draws.
+    img, draw, iw, ih, scale = pixel_canvas(w, h, (8, 4, 14))
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+
+    caps = state.setdefault("caps", [
+        dict(x=(0.15 + 0.7 * i / 4) * iw, base_r=ih * rng.uniform(0.1, 0.16),
+             stem_h=ih * rng.uniform(0.16, 0.26), phase=rng.uniform(0, 2 * np.pi),
+             hue=rng.random())
+        for i in range(5)
+    ])
+
+    bloom = 1.0 + feat["bass"] * 0.25 + (0.15 if feat["is_beat"] else 0.0)
+    for i, m in enumerate(caps):
+        sway = np.sin(local_t * 0.8 + m["phase"]) * ih * 0.03 * (1 + feat["mid"])
+        cap_r = m["base_r"] * bloom
+        t = (m["hue"] + local_t * 0.05) % 1.0
+        cap_col = tuple(int(c) for c in sample_lut(lut, np.array([t]))[0])
+        stem_col = tuple(max(0, int(c * 0.75) + 30) for c in pal["bg"])
+        dot_col = pal["accent"] if (feat["is_beat"] and i % 2 == 0) else (245, 245, 250)
+        base_y = ih * 0.92
+        _mushroom_shape(draw, m["x"], base_y, cap_r, m["stem_h"], cap_col, stem_col, dot_col, sway)
+
+    return upscale_pixelated(img, w, h)
+
+
+def _blink_amount(rng_seed_state, key, local_t):
+    """Deterministic-looking per-eye blink schedule: mostly open, occasional
+    quick close. Returns 0 (open) .. 1 (fully shut)."""
+    period = rng_seed_state.setdefault(key, 2.2 + (hash(key) % 130) / 40.0)
+    phase = (local_t % period) / period
+    if phase > 0.94:
+        return 1.0 - abs(phase - 0.97) / 0.03
+    return 0.0
+
+
+def render_eye_cluster(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A scattered field of independent eyes -- varied sizes/positions,
+    # each blinking on its own schedule, pupils dilating with the beat
+    # and tracking a slow drifting gaze. Distinct from cat_eye below
+    # (one dominant slit pupil) by being a multi-instance round-pupil
+    # cluster with per-eye blink state.
+    img, draw, iw, ih, scale = pixel_canvas(w, h, (10, 4, 16))
+    eyes = state.setdefault("eyes", [
+        dict(x=rng.uniform(0.12, 0.88) * iw, y=rng.uniform(0.15, 0.85) * ih,
+             r=ih * rng.uniform(0.06, 0.14), phase=rng.uniform(0, 6.28),
+             hue=rng.random())
+        for _ in range(6)
+    ])
+    blink_periods = state.setdefault("blink_periods", {})
+    gaze_a = local_t * 0.4
+    gx, gy = np.cos(gaze_a) * 0.35, np.sin(gaze_a * 0.7) * 0.35
+
+    for i, e in enumerate(eyes):
+        key = f"eye{i}"
+        shut = _blink_amount(blink_periods, key, local_t + e["phase"])
+        r = e["r"]
+        cx, cy = e["x"], e["y"]
+        white = (245, 245, 250)
+        open_h = max(0.5, r * (1.0 - shut))
+        # fill and outline in one ellipse call -- a separate draw.arc() on
+        # the same bbox rasterizes very slightly differently from the
+        # filled ellipse at these tiny internal-canvas sizes, leaving a
+        # visible stray crescent line instead of a clean matching outline.
+        draw.ellipse([cx - r, cy - open_h, cx + r, cy + open_h], fill=white, outline=(20, 16, 24))
+        pupil_r = r * (0.42 + feat["bass"] * 0.22)
+        px, py = cx + gx * r * 0.4, cy + gy * open_h * 0.4
+        t = (e["hue"] + local_t * 0.08) % 1.0
+        iris_col = pick_color(pal["colors"], t * len(pal["colors"]))
+        draw.ellipse([px - pupil_r * 1.55, py - min(open_h, pupil_r * 1.55),
+                      px + pupil_r * 1.55, py + min(open_h, pupil_r * 1.55)], fill=iris_col)
+        pr = pupil_r * 0.55
+        draw.ellipse([px - pr, py - min(open_h, pr), px + pr, py + min(open_h, pr)], fill=(6, 6, 10))
+        if shut < 0.3:
+            draw.ellipse([px - pr * 0.3, py - pr * 0.3, px, py], fill=(255, 255, 255))
+
+    return upscale_pixelated(img, w, h)
+
+
+def render_cat_eye(w, h, feat, local_t, rng, pal, ctrl, state):
+    # One large centered eye with a vertical cat-slit pupil (rather than
+    # eye_cluster's round pupils) that contracts to a thin line on loud
+    # passages and dilates wide on quiet ones, with a slow independent
+    # blink and radiating iris color bands.
+    img, draw, iw, ih, scale = pixel_canvas(w, h, (6, 4, 10))
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+    cx, cy = iw / 2, ih / 2
+    R = min(iw, ih) * 0.42
+
+    blink_period = state.setdefault("blink_period", 3.4)
+    phase = (local_t % blink_period) / blink_period
+    shut = 0.0
+    if phase > 0.92:
+        shut = 1.0 - abs(phase - 0.96) / 0.04
+    shut = clamp(shut, 0.0, 1.0)
+    open_h = max(0.5, R * (1.0 - shut) * 0.62)
+
+    n_bands = 10
+    for b in range(n_bands, 0, -1):
+        t = b / n_bands
+        r = R * t
+        col = tuple(int(c) for c in sample_lut(lut, np.array([(t + local_t * 0.05) % 1.0]))[0])
+        draw.ellipse([cx - r, cy - open_h * t, cx + r, cy + open_h * t], fill=col)
+    draw.ellipse([cx - R, cy - open_h, cx + R, cy + open_h], outline=(15, 12, 18), width=2)
+
+    quiet = 1.0 - clamp(feat["rms"] * 1.3, 0.0, 1.0)
+    dilate = 0.18 + quiet * 0.55
+    slit_w = max(1.0, R * dilate * (1.0 - shut))
+    slit_h = open_h * 0.92
+    draw.ellipse([cx - slit_w, cy - slit_h, cx + slit_w, cy + slit_h], fill=(8, 6, 10))
+    hl_r = max(1.0, slit_w * 0.5)
+    draw.ellipse([cx - slit_w * 0.7, cy - slit_h * 0.5, cx - slit_w * 0.7 + hl_r, cy - slit_h * 0.5 + hl_r],
+                 fill=(255, 255, 255))
+
+    return upscale_pixelated(img, w, h)
+
+
+_MAGIC_BALL_MESSAGES = ["YES", "NO", "ASK AGAIN", "FOR SURE", "DOUBTFUL", "Y2K SAYS YES"]
+
+
+def render_magic_ball(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A crystal/8-ball orb with a swirling smoke-like interior (an angle
+    # + radius field rotating at a rate that itself drifts over time,
+    # sampled through the palette) and a floating fortune-window that
+    # cycles a message on each beat -- a Y2K "magic 8-ball" homage no
+    # other pattern touches.
+    img, draw, iw, ih, scale = pixel_canvas(w, h, (6, 4, 12))
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+    cx, cy = iw / 2, ih * 0.46
+    R = min(iw, ih) * 0.36
+
+    r, theta = polar_grids(iw, ih)
+    swirl_speed = 0.6 + feat["mid"] * 0.9
+    swirl = state.get("swirl", 0.0) + swirl_speed * (1 / 30.0)
+    state["swirl"] = swirl
+    # Both angular frequencies here must be integers -- theta wraps from
+    # -pi to +pi at the negative-x ray, and a non-integer multiplier turns
+    # that wrap into a visible phase-mismatch seam running through the
+    # smoke instead of a seamless swirl.
+    field = np.sin(r * 0.22 - theta * 3.0 + swirl * 2.2) * 0.5 + \
+        np.sin(r * 0.11 + theta * 2.0 - swirl * 1.3) * 0.5
+    t = (field * 0.5 + 0.5 + local_t * 0.03) % 1.0
+    smoke = sample_lut(lut, t).astype(np.uint8)
+    smoke_img = Image.fromarray(smoke, "RGB")
+
+    mask = Image.new("L", (iw, ih), 0)
+    ImageDraw.Draw(mask).ellipse([cx - R, cy - R, cx + R, cy + R], fill=255)
+    img.paste(smoke_img, (0, 0), mask)
+
+    hl = Image.new("L", (iw, ih), 0)
+    ImageDraw.Draw(hl).ellipse([cx - R * 0.55, cy - R * 0.7, cx - R * 0.1, cy - R * 0.25], fill=70)
+    img.paste(Image.new("RGB", (iw, ih), (255, 255, 255)), (0, 0), hl)
+    draw.ellipse([cx - R, cy - R, cx + R, cy + R], outline=(230, 230, 240), width=1)
+
+    stand_w = R * 0.6
+    draw.polygon([(cx - stand_w, ih), (cx + stand_w, ih), (cx + stand_w * 0.6, cy + R),
+                  (cx - stand_w * 0.6, cy + R)], fill=(20, 14, 10))
+
+    upscaled = upscale_pixelated(img, w, h)
+
+    # The fortune-window text is drawn AFTER the chunky pixel-canvas
+    # upscale, directly at full resolution, rather than on the tiny
+    # internal canvas -- the default bitmap font is a fixed pixel size,
+    # so on a ~160px-wide internal canvas even short messages overflow
+    # a window sized proportionally to the ball. Drawing crisp text over
+    # the already-pixelated ball reads like a real toy's small LCD
+    # readout window, legible regardless of output resolution.
+    state.setdefault("msg_idx", 0)
+    if feat["is_beat"] and rng.random() < 0.6:
+        state["msg_idx"] = (state["msg_idx"] + 1) % len(_MAGIC_BALL_MESSAGES)
+    msg = _MAGIC_BALL_MESSAGES[state["msg_idx"]]
+    draw2 = ImageDraw.Draw(upscaled)
+    cx2, cy2, R2 = cx * scale, cy * scale, R * scale
+    win_r = R2 * 0.55
+    win_top = cy2 + R2 * 0.05
+    draw2.ellipse([cx2 - win_r, win_top, cx2 + win_r, win_top + win_r * 1.3],
+                  fill=(10, 20, 60), outline=(180, 190, 230), width=max(1, round(scale * 0.4)))
+    bbox = draw2.textbbox((0, 0), msg, font=_DEFAULT_FONT)
+    tw_, th_ = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw2.text((cx2 - tw_ / 2, win_top + win_r * 0.65 - th_ / 2), msg, font=_DEFAULT_FONT, fill=(210, 230, 255))
+
+    return upscaled
+
+
+def render_melting_drip(w, h, feat, local_t, rng, pal, ctrl, state):
+    # Dali-style melting paint: solid color bands undulate along a
+    # horizon line and periodically sprout thin dripping tendrils that
+    # lengthen downward over time before retracting and re-forming. A
+    # per-column melt/drip distortion distinct from pixel_rain's discrete
+    # falling drops or demo_fire's upward heat propagation.
+    img, draw, iw, ih, scale = pixel_canvas(w, h, (14, 8, 10))
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+    n_bands = 7
+    band_w = iw / n_bands
+    horizon = ih * 0.4
+    dt = 1 / 30.0
+    bass_boost = 1.0 + feat["bass"] * 1.4
+
+    drips = state.setdefault("drips", [None] * n_bands)
+
+    for b in range(n_bands):
+        t = (b / n_bands + local_t * 0.02) % 1.0
+        col = tuple(int(c) for c in sample_lut(lut, np.array([t]))[0])
+        x0, x1 = b * band_w, (b + 1) * band_w
+        phase = b * 1.7
+        n_seg = 6
+        pts_top = []
+        for i in range(n_seg + 1):
+            x = x0 + (x1 - x0) * i / n_seg
+            wob = np.sin(local_t * 0.9 + phase + x * 0.05) * ih * 0.04 * (1 + feat["mid"] * 0.6)
+            pts_top.append((x, horizon + wob))
+        poly = [(x0, 0), (x1, 0)] + list(reversed(pts_top))
+        draw.polygon(poly, fill=col)
+
+        d = drips[b]
+        if d is None or d["len"] > d["max_len"]:
+            drips[b] = d = dict(x=x0 + band_w * rng.uniform(0.3, 0.7), len=0.0,
+                                 max_len=ih * rng.uniform(0.25, 0.55),
+                                 width=band_w * rng.uniform(0.18, 0.32))
+        d["len"] += (6.0 + feat["rms"] * 14.0) * bass_boost * dt
+        wob = np.sin(local_t * 0.9 + phase + d["x"] * 0.05) * ih * 0.04 * (1 + feat["mid"] * 0.6)
+        top_y = horizon + wob
+        tip_y = top_y + d["len"]
+        hw = d["width"] * 0.5
+        draw.polygon([(d["x"] - hw, top_y), (d["x"] + hw, top_y), (d["x"], tip_y)], fill=col)
+
+    return upscale_pixelated(img, w, h)
+
+
+def _draw_fractal_branch(draw, x, y, angle, length, depth, lut, hue_t, spread, shrink):
+    """Recursively draw a branch, then two child branches splayed by
+    +/-spread and shrunk by `shrink` -- true recursive subdivision,
+    unlike every other pattern's fixed-count loops."""
+    if depth <= 0 or length < 1.5:
+        return
+    x2 = x + length * np.cos(angle)
+    y2 = y + length * np.sin(angle)
+    col = tuple(int(c) for c in sample_lut(lut, np.array([hue_t]))[0])
+    draw.line([(x, y), (x2, y2)], fill=col, width=max(1, depth // 2))
+    next_hue = (hue_t + 0.05) % 1.0
+    _draw_fractal_branch(draw, x2, y2, angle - spread, length * shrink, depth - 1, lut, next_hue, spread, shrink)
+    _draw_fractal_branch(draw, x2, y2, angle + spread, length * shrink, depth - 1, lut, next_hue, spread, shrink)
+
+
+def render_fractal_bloom(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A recursive branching fractal tree/flower that slowly rotates and
+    # blooms outward with the beat -- true recursion, a technique nothing
+    # else in this app uses (everything else iterates a fixed loop count
+    # rather than branching).
+    img, draw, iw, ih, scale = pixel_canvas(w, h, (10, 4, 16))
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+    cx, cy = iw / 2, ih * 0.92
+    chaos = ctrl["chaos"]
+
+    depth = 6
+    shrink = 0.72
+    # total reach of a straight run of branches is base_len/(1-shrink);
+    # sized (with margin for the bass/beat pulse below) so the whole
+    # bloom stays inside the frame above cy instead of its crown running
+    # off the top edge.
+    base_len = min(iw, ih) * 0.15 * (1 + feat["bass"] * 0.3 + (0.15 if feat["is_beat"] else 0))
+    spread = np.radians(24 + chaos * 20 + np.sin(local_t * 0.3) * 6)
+    rot = local_t * 0.15
+
+    n_arms = 5
+    for i in range(n_arms):
+        base_angle = -np.pi / 2 + (i - (n_arms - 1) / 2) * 0.5 + rot
+        hue_t = (i / n_arms + local_t * 0.05) % 1.0
+        _draw_fractal_branch(draw, cx, cy, base_angle, base_len, depth, lut, hue_t, spread, shrink)
+
+    return upscale_pixelated(img, w, h)
+
+
+def render_tie_dye_swirl(w, h, feat, local_t, rng, pal, ctrl, state):
+    # A differential-rotation swirl: the twist angle added to each pixel
+    # decays smoothly with distance from center, so inner rings shear
+    # past outer rings, applied to a radial rainbow-band field for a
+    # tie-dye poster look. Distinct from kaleidoscope's mirror symmetry
+    # and chrome_tunnel's radial zoom -- this is a continuous per-radius
+    # shear, not a reflection or a scroll.
+    scale = 0.5
+    rw, rh = max(2, round(w * scale)), max(2, round(h * scale))
+    r, theta = polar_grids(rw, rh)
+    R = min(rw, rh) * 0.5
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+
+    spin = state.get("spin", 0.0) + (0.5 + feat["mid"] * 0.8) * (1 / 30.0)
+    state["spin"] = spin
+    chaos = ctrl["chaos"]
+    twirl_strength = 2.5 + chaos * 3.5 + feat["bass"] * 2.0
+    rn = np.clip(r / R, 0.0, 1.4)
+    # exp() decay (rather than a hard radius cutoff) keeps the twist
+    # continuous everywhere, so there's no visible seam where the twirl
+    # effect would otherwise switch off.
+    twirled_theta = theta + twirl_strength * np.exp(-rn * 1.6) + spin * 0.3
+
+    n_bands = 7
+    t = ((twirled_theta / (2 * np.pi)) * n_bands + rn * 3.0 + local_t * 0.1) % 1.0
+    color = sample_lut(lut, t)
+    img = Image.fromarray(color, "RGB")
+    if (rw, rh) != (w, h):
+        img = img.resize((w, h), Image.BILINEAR)
+    return img
+
+
+def render_sacred_geometry(w, h, feat, local_t, rng, pal, ctrl, state):
+    # Two counter-rotating "Flower of Life"-style rosettes of overlapping
+    # circle outlines, sliding past each other to produce a moire
+    # interference pattern -- a distinct overlapping-circle-grid
+    # technique nothing else in this app uses.
+    img, draw, iw, ih, scale = pixel_canvas(w, h, (6, 4, 12))
+    cx, cy = iw / 2, ih / 2
+    R = min(iw, ih) * 0.32
+    lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
+    n_petals = 6
+    ring_r = R * 0.55
+
+    rot_a = local_t * (0.25 + feat["mid"] * 0.3)
+    rot_b = -local_t * (0.18 + feat["treble"] * 0.35)
+    pulse = 1.0 + feat["bass"] * 0.12 + (0.08 if feat["is_beat"] else 0.0)
+
+    for rot, hue_off in ((rot_a, 0.0), (rot_b, 0.5)):
+        col = tuple(int(c) for c in sample_lut(lut, np.array([(hue_off + local_t * 0.04) % 1.0]))[0])
+        rr = R * pulse
+        draw.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=col, width=1)
+        for i in range(n_petals):
+            a = rot + i * 2 * np.pi / n_petals
+            px, py = cx + ring_r * pulse * np.cos(a), cy + ring_r * pulse * np.sin(a)
+            pr = ring_r * pulse
+            draw.ellipse([px - pr, py - pr, px + pr, py + pr], outline=col, width=1)
+
+    draw.ellipse([cx - 2, cy - 2, cx + 2, cy + 2], fill=(250, 250, 255))
+    return upscale_pixelated(img, w, h)
+
+
 PATTERN_REGISTRY = {
     # pack 1: waveforms
     "chrome_tunnel": render_chrome_tunnel,
@@ -2261,6 +2629,15 @@ PATTERN_REGISTRY = {
     "demo_fire": render_demo_fire,
     "cymatics_ripple": render_cymatics_ripple,
     "pixel_snake": render_pixel_snake,
+    # pack 6: trippy visuals
+    "psych_mushrooms": render_psych_mushrooms,
+    "eye_cluster": render_eye_cluster,
+    "cat_eye": render_cat_eye,
+    "magic_ball": render_magic_ball,
+    "melting_drip": render_melting_drip,
+    "fractal_bloom": render_fractal_bloom,
+    "tie_dye_swirl": render_tie_dye_swirl,
+    "sacred_geometry": render_sacred_geometry,
 }
 
 PATTERN_NAMES = list(PATTERN_REGISTRY.keys())
@@ -2276,4 +2653,6 @@ SCENE_PACKS = {
                   "virtual_pet", "holo_sticker", "chrome_bubble_text", "crt_boot"],
     "waveforms_ii": ["radial_spectrum", "liquid_chrome", "sonar_ping", "vu_meters",
                       "lissajous_scope", "demo_fire", "cymatics_ripple", "pixel_snake"],
+    "trippy_visuals": ["psych_mushrooms", "eye_cluster", "cat_eye", "magic_ball",
+                        "melting_drip", "fractal_bloom", "tie_dye_swirl", "sacred_geometry"],
 }

@@ -50,6 +50,7 @@ PACK_TITLES = {
     "space_sunsets": "Pack 3 — Sunsets & Space",
     "retro_y2k": "Pack 4 — Retro Y2K",
     "waveforms_ii": "Pack 5 — Waveforms II",
+    "trippy_visuals": "Pack 6 — Trippy Visuals",
 }
 
 SNIPPET_PREVIEW_SECONDS = 4.0  # length of a "click to preview here" snippet
