@@ -410,7 +410,11 @@ def render_sunset_pixel(w, h, feat, local_t, rng, pal, ctrl, state):
     scx, scy = iw / 2, horizon_y
     sun_top = np.array((255, 232, 120))
     sun_bot = np.array((255, 40, 130))
-    stripe_offset = (local_t * (1.2 + feat["mid"] * 2)) % 1.0
+    # Accumulated in state rather than `local_t * rate` -- see
+    # render_galaxy_swirl for why that anti-pattern can make the scroll
+    # briefly stutter or reverse.
+    stripe_offset = (state.get("stripe_offset", 0.0) + (1.2 + feat["mid"] * 2) * (1 / 30.0)) % 1.0
+    state["stripe_offset"] = stripe_offset
     for yy in range(int(scy - sun_r), int(scy) + 1):
         dy = scy - yy
         dx = np.sqrt(max(0, sun_r * sun_r - dy * dy))
@@ -1327,7 +1331,11 @@ def render_cars_showroom_spin(w, h, feat, local_t, rng, pal, ctrl, state):
     cx, cy = w / 2, h * 0.62
     for r, a in ((w * 0.34, 60), (w * 0.24, 90), (w * 0.15, 140)):
         draw.ellipse([cx - r, cy + h * 0.04, cx + r, cy + h * 0.09], fill=(a, a // 3, a // 2))
-    rot = local_t * (0.6 + feat["mid"] * 0.6)
+    # Accumulated in state rather than `local_t * rate` -- see
+    # render_galaxy_swirl for why a feat-dependent rate multiplied by
+    # local_t directly can make the angle briefly go backward.
+    rot = state.get("rot", 0.0) + (0.6 + feat["mid"] * 0.6) * (1 / 30.0)
+    state["rot"] = rot
     s_side = np.sin(rot)   # which way the car is facing along the turntable
     c_side = np.cos(rot)   # how edge-on (side profile) vs face-on (front/rear) it currently is
     # keep the on-screen size roughly constant across the whole rotation --
@@ -1531,7 +1539,14 @@ def render_galaxy_swirl(w, h, feat, local_t, rng, pal, ctrl, state):
     img, draw, iw, ih, scale = pixel_canvas(w, h, (6, 4, 16))
     cx, cy = iw / 2, ih / 2
     lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
-    rot = local_t * (0.3 + feat["mid"] * 0.6)
+    # Accumulate rotation in state rather than `local_t * rate` -- with a
+    # rate that varies frame to frame with feat["mid"], local_t * rate is
+    # NOT monotonic (it can decrease when the rate drops even though
+    # local_t keeps rising), which reads as the swirl stuttering or
+    # briefly spinning backward. Integrating rate*dt into a persistent
+    # angle guarantees it only ever moves forward.
+    rot = state.get("rot", 0.0) + (0.3 + feat["mid"] * 0.6) * (1 / 30.0)
+    state["rot"] = rot
     for arm in range(3):
         base_a = arm * 2 * np.pi / 3
         for k in range(30):
@@ -1554,7 +1569,11 @@ def render_cd_burn_spin(w, h, feat, local_t, rng, pal, ctrl, state):
     img, draw, iw, ih, scale = pixel_canvas(w, h, (10, 8, 16))
     cx, cy = iw / 2, ih * 0.42
     R = min(iw, ih) * 0.28
-    rot = local_t * (2 + feat["mid"] * 3)
+    # Accumulated in state rather than `local_t * rate` -- see
+    # render_galaxy_swirl for why that anti-pattern can make the spin
+    # briefly stutter or reverse.
+    rot = state.get("rot", 0.0) + (2 + feat["mid"] * 3) * (1 / 30.0)
+    state["rot"] = rot
     lut = state.setdefault("lut", build_palette_lut(pal["colors"]))
     for i in range(24):
         a = i / 24 * 2 * np.pi + rot
@@ -2028,7 +2047,11 @@ def render_lissajous_scope(w, h, feat, local_t, rng, pal, ctrl, state):
 
     n_pts = 260
     tt = np.linspace(0, 2 * np.pi, n_pts)
-    phase = local_t * (0.4 + feat["mid"] * 0.6)
+    # Accumulated in state rather than `local_t * rate` -- see
+    # render_galaxy_swirl for why that anti-pattern can make the figure's
+    # drift briefly stutter or reverse.
+    phase = state.get("phase", 0.0) + (0.4 + feat["mid"] * 0.6) * (1 / 30.0)
+    state["phase"] = phase
     wobble = chaos * 0.4 * np.sin(local_t * 1.7)
     xs = cx + R * (0.75 + 0.25 * feat["bass"]) * np.sin(a * tt + phase + wobble)
     ys = cy + R * (0.75 + 0.25 * feat["treble"]) * np.sin(b * tt + phase * 1.3)
@@ -2149,7 +2172,11 @@ def render_cymatics_ripple(w, h, feat, local_t, rng, pal, ctrl, state):
         for _ in range(n_src)
     ])
 
-    phase = local_t * (1.1 + feat["mid"] * 1.3)
+    # Accumulated in state rather than `local_t * rate` -- see
+    # render_galaxy_swirl for why that anti-pattern can make the wave
+    # sweep briefly stutter or reverse.
+    phase = state.get("phase", 0.0) + (1.1 + feat["mid"] * 1.3) * (1 / 30.0)
+    state["phase"] = phase
     field = np.zeros((rh, rw), dtype=np.float32)
     for i, s in enumerate(sources):
         dx = xs - s["x"]
@@ -2567,8 +2594,12 @@ def render_sacred_geometry(w, h, feat, local_t, rng, pal, ctrl, state):
     n_petals = 6
     ring_r = R * 0.55
 
-    rot_a = local_t * (0.25 + feat["mid"] * 0.3)
-    rot_b = -local_t * (0.18 + feat["treble"] * 0.35)
+    # Accumulated in state rather than `local_t * rate` -- see
+    # render_galaxy_swirl for why that anti-pattern can make a rotation
+    # briefly stutter or reverse.
+    rot_a = state.get("rot_a", 0.0) + (0.25 + feat["mid"] * 0.3) * (1 / 30.0)
+    rot_b = state.get("rot_b", 0.0) - (0.18 + feat["treble"] * 0.35) * (1 / 30.0)
+    state["rot_a"], state["rot_b"] = rot_a, rot_b
     pulse = 1.0 + feat["bass"] * 0.12 + (0.08 if feat["is_beat"] else 0.0)
 
     for rot, hue_off in ((rot_a, 0.0), (rot_b, 0.5)):
